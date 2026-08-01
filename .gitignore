@@ -1,4 +1,5 @@
 node_modules/
 .env
+CREDENTIALS.md
 npm-debug.log*
 .DS_Store
