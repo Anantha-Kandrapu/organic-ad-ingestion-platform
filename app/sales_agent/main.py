@@ -139,6 +139,7 @@ def get_conversation(conversation_id: int) -> dict:
             if conv.satisfaction_score is not None
             else None,
             "satisfaction_label": conv.satisfaction_label,
+            "offer_preference": conv.offer_preference,
             "messages": [
                 {"role": m.role, "content": m.content, "at": m.created_at.isoformat()}
                 for m in messages

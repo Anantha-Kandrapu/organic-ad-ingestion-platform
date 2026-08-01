@@ -52,6 +52,8 @@ class Offer(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
     name: Mapped[str] = mapped_column(String(120))
+    # kind: bulk (volume tier), loyalty (flat, any quantity), or bundle.
+    kind: Mapped[str] = mapped_column(String(20), default="bulk")
     min_quantity: Mapped[int] = mapped_column(Integer, default=1)
     unit_price: Mapped[float] = mapped_column(Numeric(12, 2))
     discount_pct: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
@@ -84,6 +86,9 @@ class Conversation(Base):
         Numeric(4, 3), nullable=True
     )
     satisfaction_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Rolling note of the customer's offer/product preferences, refined each turn
+    # and fed back into the agent's context on subsequent turns.
+    offer_preference: Mapped[str | None] = mapped_column(String(400), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_now, onupdate=_now

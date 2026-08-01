@@ -116,6 +116,7 @@ def make_tools(conversation_id: int) -> list:
                         {
                             "offer_id": o.id,
                             "name": o.name,
+                            "kind": o.kind,
                             "min_quantity": o.min_quantity,
                             "unit_price": float(o.unit_price),
                             "discount_pct": float(o.discount_pct),
@@ -138,6 +139,7 @@ def make_tools(conversation_id: int) -> list:
                     "offer_id": o.id,
                     "product_id": o.product_id,
                     "name": o.name,
+                    "kind": o.kind,
                     "min_quantity": o.min_quantity,
                     "unit_price": float(o.unit_price),
                     "discount_pct": float(o.discount_pct),
@@ -170,6 +172,7 @@ def make_tools(conversation_id: int) -> list:
                             {
                                 "offer_id": o.id,
                                 "name": o.name,
+                                "kind": o.kind,
                                 "min_quantity": o.min_quantity,
                                 "unit_price": float(o.unit_price),
                                 "discount_pct": float(o.discount_pct),
@@ -250,6 +253,19 @@ def make_tools(conversation_id: int) -> list:
 
             db.flush()
             state = _cart_state(db, cart)
+            # Attach live stock for the touched product so the agent can confirm
+            # availability for the requested quantity.
+            stock = sum(
+                inv.quantity_available
+                for inv in db.query(Inventory).filter(
+                    Inventory.product_id == product_id
+                )
+            )
+            line = next(
+                (i for i in state["items"] if i["product_id"] == product_id), None
+            )
+            state["product_stock_available"] = stock
+            state["requested_within_stock"] = line is None or line["quantity"] <= stock
             db.commit()
             return _dump(state)
 

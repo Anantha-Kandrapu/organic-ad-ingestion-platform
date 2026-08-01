@@ -54,9 +54,14 @@ def run_turn(conversation_id: int, user_message: str) -> None:
     try:
         _save_message(cid, "user", user_message)
         history = _load_history(cid)
-        graph = build_graph(cid)
 
-        inputs = {"messages": [system_message()] + history}
+        # Load any preferences learned on prior turns so the agent honors them.
+        with SessionLocal() as db:
+            conv = db.get(Conversation, cid)
+            prior_pref = conv.offer_preference if conv else None
+
+        graph = build_graph(cid)
+        inputs = {"messages": [system_message(prior_pref)] + history}
         final_parts: list[str] = []
 
         for mode, data in graph.stream(inputs, stream_mode=["updates", "messages"]):
@@ -103,14 +108,16 @@ def run_turn(conversation_id: int, user_message: str) -> None:
             cid, {"type": "message", "role": "assistant", "content": final_text}
         )
 
-        analysis = analyze_turn(user_message, final_text)
+        analysis = analyze_turn(user_message, final_text, prior_pref)
         if analysis is not None:
+            new_pref = analysis.offer_preference.strip() or prior_pref
             with SessionLocal() as db:
                 conv = db.get(Conversation, cid)
                 if conv:
                     conv.emotion = analysis.emotion
                     conv.satisfaction_score = analysis.satisfaction_score
                     conv.satisfaction_label = analysis.satisfaction_label
+                    conv.offer_preference = new_pref
                     db.commit()
             redis_bus.publish(
                 cid,
@@ -119,6 +126,8 @@ def run_turn(conversation_id: int, user_message: str) -> None:
                     "emotion": analysis.emotion,
                     "satisfaction_score": analysis.satisfaction_score,
                     "satisfaction_label": analysis.satisfaction_label,
+                    "likes_offers": analysis.likes_offers,
+                    "offer_preference": new_pref,
                 },
             )
 

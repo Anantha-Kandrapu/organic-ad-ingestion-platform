@@ -4,7 +4,8 @@ from .db import SessionLocal
 from .models import Customer, Inventory, Offer, Product
 
 # (sku, name, category, unit, base_price, description, [offers], stock)
-# offer = (name, min_qty, unit_price, discount_pct)
+# offer = (name, min_qty, unit_price, discount_pct, kind)
+#   kind: "bulk" (volume tier) | "loyalty" (flat, any qty) | "bundle"
 _PRODUCTS = [
     (
         "BV-COLA-24",
@@ -13,7 +14,11 @@ _PRODUCTS = [
         "case of 24",
         14.40,
         "Case of 24 cans of classic cola.",
-        [("Pallet deal 50+", 50, 12.50, 13.2), ("Bulk 20+", 20, 13.20, 8.3)],
+        [
+            ("Pallet deal 50+", 50, 12.50, 13.2, "bulk"),
+            ("Bulk 20+", 20, 13.20, 8.3, "bulk"),
+            ("Beverage bundle 7% (10+ cases)", 10, 13.39, 7.0, "bundle"),
+        ],
         320,
     ),
     (
@@ -23,7 +28,7 @@ _PRODUCTS = [
         "case of 12",
         6.00,
         "Case of 12 x 1L still spring water.",
-        [("Bulk 40+", 40, 5.10, 15.0)],
+        [("Bulk 40+", 40, 5.10, 15.0, "bulk")],
         900,
     ),
     (
@@ -33,7 +38,10 @@ _PRODUCTS = [
         "box of 30",
         21.00,
         "Box of 30 x 50g salted potato chips.",
-        [("Bulk 25+", 25, 18.90, 10.0)],
+        [
+            ("Bulk 25+", 25, 18.90, 10.0, "bulk"),
+            ("Snack bundle 6% (8+ boxes)", 8, 19.74, 6.0, "bundle"),
+        ],
         140,
     ),
     (
@@ -43,7 +51,7 @@ _PRODUCTS = [
         "box of 20",
         30.00,
         "Box of 20 x 100g roasted mixed nuts.",
-        [("Bulk 15+", 15, 27.00, 10.0)],
+        [("Bulk 15+", 15, 27.00, 10.0, "bulk")],
         60,
     ),
     (
@@ -53,7 +61,7 @@ _PRODUCTS = [
         "case of 12",
         11.40,
         "Case of 12 x 1L UHT whole milk, long life.",
-        [("Pallet 60+", 60, 9.60, 15.8)],
+        [("Pallet 60+", 60, 9.60, 15.8, "bulk")],
         410,
     ),
     (
@@ -63,7 +71,7 @@ _PRODUCTS = [
         "box of 10",
         45.00,
         "Box of 10 x 500g mature cheddar blocks.",
-        [("Bulk 12+", 12, 40.50, 10.0)],
+        [("Bulk 12+", 12, 40.50, 10.0, "bulk")],
         35,
     ),
     (
@@ -73,7 +81,7 @@ _PRODUCTS = [
         "bag",
         18.00,
         "5kg bag of premium basmati rice.",
-        [("Pallet 100+", 100, 15.30, 15.0)],
+        [("Pallet 100+", 100, 15.30, 15.0, "bulk")],
         220,
     ),
 ]
@@ -103,17 +111,32 @@ def seed_if_empty() -> None:
             )
             db.add(product)
             db.flush()  # assign product.id
-            for oname, minq, uprice, disc in offers:
+            for oname, minq, uprice, disc, kind in offers:
                 db.add(
                     Offer(
                         product_id=product.id,
                         name=oname,
+                        kind=kind,
                         min_quantity=minq,
                         unit_price=uprice,
                         discount_pct=disc,
                         valid_until="2026-12-31",
                     )
                 )
+            # Every product also gets a non-bulk lever: a flat first-order
+            # discount that applies at any quantity, so the agent has an offer
+            # to pivot to for customers who dislike large bulk commitments.
+            db.add(
+                Offer(
+                    product_id=product.id,
+                    name="First-order 6% off (any quantity)",
+                    kind="loyalty",
+                    min_quantity=1,
+                    unit_price=round(price * 0.94, 2),
+                    discount_pct=6.0,
+                    valid_until="2026-12-31",
+                )
+            )
             db.add(
                 Inventory(product_id=product.id, warehouse="Main", quantity_available=stock)
             )
