@@ -1,0 +1,17 @@
+{
+  "name": "phonecall-inworld-stt-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Streams inbound Twilio call audio to Inworld STT and emits transcripts.",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/audio.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}
