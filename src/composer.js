@@ -1,4 +1,12 @@
-export function composeDemoTurn({ callSid, transcript, selection, turnId, llmText }) {
+export function composeDemoTurn({
+  callSid,
+  transcript,
+  selection,
+  turnId,
+  llmText,
+  llmSource = "inworld_llm_api",
+  llmModel,
+}) {
   const cleanTranscript = transcript?.trim();
   if (!cleanTranscript) throw new TypeError("transcript is required");
   if (!callSid?.trim()) throw new TypeError("callSid is required");
@@ -12,7 +20,8 @@ export function composeDemoTurn({ callSid, transcript, selection, turnId, llmTex
   const llmResponse = {
     id: `llm_${turnId}`,
     type: "llm_response",
-    source: llmText?.trim() ? "wholesale_agent" : "demo_llm",
+    source: llmText?.trim() ? llmSource : "demo_llm",
+    model: llmModel || null,
     text: organicText,
   };
   let injectedAd = null;

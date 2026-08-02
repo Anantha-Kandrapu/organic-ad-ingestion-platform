@@ -101,7 +101,7 @@ function buildSelection(product, score, matchedTerms) {
       productUrl: product.productUrl || null,
     },
     spokenCopy: `Sponsored suggestion from ${product.brand || "our partner"}: ${spokenTitle} is currently ${price}.`,
-    breakCopy: `While I fetch the web results, here's a sponsored message from ${product.brand || "our partner"}. ${spokenTitle} is currently ${price}.`,
+    breakCopy: `While I fetch your results, sponsored by ${product.brand || "our partner"}.`,
     match: { score, matchedTerms },
   };
 }

@@ -94,13 +94,13 @@ async function runVoiceTurn(transcript) {
     const sponsorBreak = await sponsorRequest;
     renderSegments(sponsorBreak.segments);
     responsePanel.hidden = false;
-    const timeline = [{ event: "search_started", at: new Date().toISOString() }];
+    const timeline = [{ event: "llm_request_started", at: new Date().toISOString() }];
     json.textContent = JSON.stringify({ sponsorBreak, agentTurn: "running_in_parallel", timeline }, null, 2);
     debugPanel.hidden = false;
-    status.textContent = "Web search running · generating sponsored audio with Inworld";
+    status.textContent = "LLM request running in parallel · generating sponsored audio";
     const sponsorAudio = await requestTts(sponsorBreak.injectedAd.text, "sponsor");
     timeline.push({ event: "sponsor_tts_ready", provider: "inworld", at: new Date().toISOString() });
-    status.textContent = "Web search running · sponsored message playing";
+    status.textContent = "LLM request running in parallel · sponsored message playing";
     await playAudio(sponsorAudio);
     timeline.push({ event: "sponsor_finished", at: new Date().toISOString() });
 
@@ -111,7 +111,7 @@ async function runVoiceTurn(transcript) {
     const agentAudio = await requestTts(agentText, "agent");
     timeline.push({ event: "agent_tts_ready", provider: "inworld", at: new Date().toISOString() });
     const result = {
-      type: "voice_search_with_sponsor",
+      type: "voice_llm_with_sponsor",
       input: { type: "caller_transcript", text: transcript },
       sponsorBreak,
       agentTurn,
@@ -125,7 +125,7 @@ async function runVoiceTurn(transcript) {
       timeline,
     };
     json.textContent = JSON.stringify(result, null, 2);
-    status.textContent = "Web results ready · assistant response playing";
+    status.textContent = "LLM response ready · assistant audio playing";
     await playAudio(agentAudio);
     timeline.push({ event: "agent_response_finished", at: new Date().toISOString() });
     json.textContent = JSON.stringify(result, null, 2);

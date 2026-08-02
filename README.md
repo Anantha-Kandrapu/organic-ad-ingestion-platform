@@ -6,8 +6,8 @@ by Inworld streaming STT, and emits transcript events from
 `inworld/inworld-stt-1`.
 
 It also exposes an ad-selection layer backed by locally ingested Bright Data
-products, a browser voice demo, Inworld TTS, a wholesale-agent integration, and
-a Twilio speech-driven call flow. It does not place orders.
+products, a browser voice demo, direct Inworld LLM and TTS calls, and a Twilio
+speech-driven call flow. It does not place orders.
 
 ## Provider flow
 
@@ -131,10 +131,9 @@ the agent response. The UI and debug JSON preserve separate `injected_ad` and
 `composedResponse.text` is derived from these segments, so the demo can show the
 exact insertion boundary while still producing one string suitable for speech.
 
-When `WHOLESALE_AGENT_URL` is configured, the `llmResponse` comes from the
-FastAPI wholesale sales agent. The ad engine still selects and inserts
-`injectedAd` independently. If the wholesale service is unavailable or exceeds
-the phone-safe timeout, the deterministic demo response is used instead.
+The `llmResponse` comes from one direct Inworld Chat Completions request. Sponsor
+selection runs independently and concurrently; the response records the actual
+model selected by Inworld when `INWORLD_LLM_MODEL=auto`.
 
 ## Callable demo
 

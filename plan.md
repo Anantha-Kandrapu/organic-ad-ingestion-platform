@@ -241,6 +241,6 @@ URL: https://YOUR_HOST/twilio/voice
 - Browser voice interface and raw JSON debugger: complete.
 - Random sponsor break during parallel product lookup: complete.
 - Inworld TTS for separate sponsor and agent audio calls: complete.
-- Wholesale Claude Haiku integration with local fallback: complete.
+- Direct Inworld Chat Completions integration: complete.
 - Live Inworld TTS provider verification: complete.
 - Public tunnel and configured Twilio phone number: pending.

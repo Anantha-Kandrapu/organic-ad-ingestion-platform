@@ -15,7 +15,6 @@ import {
   buildSpokenTurnTwiML,
   parseSpokenBudget,
 } from "./voice-demo.js";
-import { getWholesaleResponse } from "./wholesale-client.js";
 
 const requiredEnvironment = ["INWORLD_API_KEY", "TWILIO_AUTH_TOKEN", "PUBLIC_BASE_URL"];
 const missingEnvironment = requiredEnvironment.filter((name) => !process.env[name]?.trim());
@@ -33,12 +32,12 @@ const inworldApiKey = process.env.INWORLD_API_KEY;
 const inworldTtsModel = process.env.INWORLD_TTS_MODEL?.trim() || "inworld-tts-2";
 const inworldTtsSponsorVoice = process.env.INWORLD_TTS_SPONSOR_VOICE?.trim() || "Dennis";
 const inworldTtsAgentVoice = process.env.INWORLD_TTS_AGENT_VOICE?.trim() || "Ashley";
+const inworldLlmModel = process.env.INWORLD_LLM_MODEL?.trim() || "auto";
 const sttLanguage = process.env.STT_LANGUAGE || "en-US";
 const transcriptWebhookUrl = process.env.TRANSCRIPT_WEBHOOK_URL?.trim();
 const transcriptWebhookBearer = process.env.TRANSCRIPT_WEBHOOK_BEARER?.trim();
 const adApiBearer = process.env.AD_API_BEARER?.trim();
 const voiceMode = process.env.VOICE_MODE?.trim() || "demo";
-const wholesaleAgentUrl = process.env.WHOLESALE_AGENT_URL?.trim();
 const productCatalogPath = process.env.PRODUCT_CATALOG_PATH
   || new URL("../data/products/brightdata-amazon-2026-08-01.products.json", import.meta.url);
 const adFrequencyCap = Number(process.env.AD_FREQUENCY_CAP || 2);
@@ -189,12 +188,14 @@ const server = http.createServer(async (request, response) => {
           maxPrice: input.maxPrice,
         });
       const turnId = `turn_${crypto.randomUUID()}`;
-      const wholesale = await tryWholesaleResponse(transcript);
+      const llm = await generateInworldResponse(transcript);
       const turn = composeDemoTurn({
         callSid,
         transcript,
         turnId,
-        llmText: wholesale?.text,
+        llmText: llm.text,
+        llmSource: llm.source,
+        llmModel: llm.model,
         selection: selection || { eligible: false, reason: "no_match" },
       });
       console.log(JSON.stringify({
@@ -251,13 +252,15 @@ const server = http.createServer(async (request, response) => {
         intent: transcript,
         maxPrice: parseSpokenBudget(transcript),
       });
-      const wholesale = await tryWholesaleResponse(transcript);
+      const llm = await generateInworldResponse(transcript);
       const turn = composeDemoTurn({
         callSid,
         transcript,
         turnId: `turn_${crypto.randomUUID()}`,
         selection: selection || { eligible: false, reason: "no_match" },
-        llmText: wholesale?.text,
+        llmText: llm.text,
+        llmSource: llm.source,
+        llmModel: llm.model,
       });
       console.log(JSON.stringify({
         type: "voice.demo.turn",
@@ -305,6 +308,40 @@ async function synthesizeInworldSpeech(text, voiceId) {
     throw new Error(`Inworld TTS failed: ${detail}`);
   }
   return Buffer.from(payload.audioContent, "base64");
+}
+
+async function generateInworldResponse(message) {
+  const llmResponse = await fetch("https://api.inworld.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${inworldApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: inworldLlmModel,
+      max_tokens: 220,
+      messages: [
+        {
+          role: "system",
+          content: "Answer the user's request directly in two concise sentences. Do not mention ads or claim to have searched the live web.",
+        },
+        { role: "user", content: message },
+      ],
+      extra_body: { sort: ["price"] },
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const payload = await llmResponse.json();
+  const text = payload.choices?.[0]?.message?.content?.trim();
+  if (!llmResponse.ok || !text) {
+    const detail = payload.error?.message || `HTTP ${llmResponse.status}`;
+    throw new Error(`Inworld LLM failed: ${detail}`);
+  }
+  return {
+    text,
+    model: payload.model || inworldLlmModel,
+    source: "inworld_chat_completions",
+  };
 }
 
 const twilioWebSocketServer = new WebSocketServer({ noServer: true });
@@ -460,16 +497,6 @@ async function deliverTranscript(event) {
     signal: AbortSignal.timeout(5000),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-}
-
-async function tryWholesaleResponse(message) {
-  if (!wholesaleAgentUrl) return null;
-  try {
-    return await getWholesaleResponse({ baseUrl: wholesaleAgentUrl, message });
-  } catch (error) {
-    console.warn("Wholesale agent unavailable; using demo response", { message: error.message });
-    return null;
-  }
 }
 
 function isValidTwilioSignature(providedSignature, exactUrl, params) {
