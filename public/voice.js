@@ -46,8 +46,10 @@ let processor = null;
 let sourceNode = null;
 let running = false;
 let clientState = "listening"; // mirrors server state: listening | thinking | speaking
-let currentAudio = null; // in-flight TTS playback, so barge-in can stop it
+let currentAudio = null; // in-flight TTS playback
 let currentAudioUrl = null;
+let replyQueue = []; // pending reply audio segments, played in order
+let awaitingReply = false; // a real (non-filler) reply is playing/queued
 
 // --- Voice-activity gate ---
 // We only stream audio when there's real speech, so background noise and
@@ -135,6 +137,8 @@ async function start() {
 function stop() {
   running = false;
   stopPlayback();
+  awaitingReply = false;
+  replyQueue = [];
   stopTimer();
   toggle.classList.replace("end", "call");
   toggle.setAttribute("aria-label", "Call");
@@ -178,7 +182,7 @@ function onServerMessage(event) {
       break;
     }
     case "agent_audio":
-      playAgentAudio(message.data, message.filler === true);
+      handleAgentAudio(message);
       break;
     case "error":
       setStatus("error", message.message?.slice(0, 60) || "Error");
@@ -186,18 +190,43 @@ function onServerMessage(event) {
   }
 }
 
-function playAgentAudio(base64Wav, isFiller = false) {
-  stopPlayback(); // cut any playing filler when the real reply arrives
+function handleAgentAudio(message) {
+  if (message.filler) {
+    // Play a filler only if no real reply is already playing/queued.
+    if (!awaitingReply && !currentAudio) startClip(message.data, { filler: true });
+    return;
+  }
+  // Real reply segment. The first one cuts any filler and starts the queue.
+  if (!awaitingReply) {
+    awaitingReply = true;
+    stopPlayback();
+    replyQueue = [];
+  }
+  replyQueue.push({ data: message.data, final: message.final === true });
+  if (!currentAudio) pumpQueue();
+}
+
+function pumpQueue() {
+  const item = replyQueue.shift();
+  if (item) startClip(item.data, { final: item.final });
+}
+
+function startClip(base64Wav, opts) {
+  stopPlayback();
   const bytes = base64ToBytes(base64Wav);
   const blob = new Blob([bytes], { type: "audio/wav" });
   currentAudioUrl = URL.createObjectURL(blob);
   currentAudio = new Audio(currentAudioUrl);
   const onEnd = () => {
-    // Fillers don't end the turn — only the real reply signals playback_done.
-    if (!isFiller && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "playback_done" }));
-    }
     cleanupAudio();
+    if (opts.filler) return;
+    if (replyQueue.length) {
+      pumpQueue();
+    } else if (opts.final) {
+      awaitingReply = false;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "playback_done" }));
+    }
+    // non-final with empty queue: wait; the next segment will pump on arrival.
   };
   currentAudio.addEventListener("ended", onEnd);
   currentAudio.play().catch(onEnd);

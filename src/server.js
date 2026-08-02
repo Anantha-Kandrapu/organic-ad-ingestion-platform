@@ -222,6 +222,36 @@ function randomFiller() {
   return fillerCache[Math.floor(Math.random() * fillerCache.length)];
 }
 
+// Sponsored ads that fill the processing gap (in the sponsor voice). Synthesized
+// once at startup and cached, so replaying them costs no TTS quota.
+const GAP_ADS = [
+  "While I check that — today's featured deal: five percent off all dairy bulk orders over thirty units, from FreshFarm.",
+  "One moment — a quick word from AquaPure: forty-plus cases of spring water ship free today.",
+  "Just a sec — SnackCo has potato chips at the week's lowest bulk price right now.",
+  "Give me a moment — GoldenGrain basmati pallets come with a free display stand this week.",
+];
+const adClipCache = [];
+
+async function warmAds() {
+  for (const line of GAP_ADS) {
+    try {
+      const wav = await synthesizeSponsorSpeech(line);
+      adClipCache.push(wav.toString("base64"));
+    } catch (error) {
+      console.warn("Ad clip warmup failed:", error.message);
+      return;
+    }
+  }
+}
+
+// A clip to fill the gap: prefer a sponsored ad, fall back to a generic filler.
+function gapClip() {
+  if (adClipCache.length) {
+    return adClipCache[Math.floor(Math.random() * adClipCache.length)];
+  }
+  return randomFiller();
+}
+
 // Ada's own voice: Inworld (reliable, handles the conversation volume).
 async function synthesizeAgentSpeech(text) {
   return synthesizeInworldSpeech(text, inworldTtsAgentVoice);
@@ -444,9 +474,9 @@ browserVoiceServer.on("connection", (client) => {
       busy = true;
       send({ type: "user_transcript", text: clean });
       setState("thinking");
-      // Play a filler right away to cover the STT → agent → TTS gap.
-      const filler = randomFiller();
-      if (filler) send({ type: "agent_audio", filler: true, data: filler });
+      // Fill the STT → agent → TTS gap with a sponsored ad (or a filler).
+      const clip = gapClip();
+      if (clip) send({ type: "agent_audio", filler: true, data: clip });
       try {
         const reply = await sendToAgent({
           baseUrl: wholesaleAgentUrl,
@@ -554,7 +584,10 @@ twilioMediaServer.on("connection", (client) => {
 server.listen(port, () => {
   console.log(`Voice sales agent listening on http://localhost:${port}  (open /voice)`);
   console.log(`Agent backend: ${wholesaleAgentUrl}`);
-  discoverVoices().then(warmFillers); // pick sponsor voice, then pre-synth fillers
+  discoverVoices().then(() => {
+    warmFillers(); // generic fillers (Inworld)
+    warmAds(); // sponsored gap ads (sponsor voice), cached once
+  });
   if (twilioAuthToken && publicBaseUrl) {
     console.log(`Twilio media stream enabled at ${publicBaseUrl.replace(/^http/, "ws")}/twilio/media`);
   }
