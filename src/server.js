@@ -16,6 +16,8 @@ const port = Number(process.env.PORT || 8080);
 const inworldApiKey = process.env.INWORLD_API_KEY;
 const inworldTtsModel = process.env.INWORLD_TTS_MODEL?.trim() || "inworld-tts-2";
 const inworldTtsAgentVoice = process.env.INWORLD_TTS_AGENT_VOICE?.trim() || "Ashley";
+// A different Inworld voice for sponsor ads when Tenstorrent is unavailable.
+const inworldSponsorVoice = process.env.INWORLD_TTS_SPONSOR_VOICE?.trim() || "Dennis";
 // Tenstorrent-hosted TTS (Inworld-compatible). When a key is present, agent
 // replies are synthesized on Tenstorrent; otherwise Inworld is called directly.
 const tenstorrentApiKey = process.env.TENSTORRENT_API_KEY?.trim();
@@ -62,7 +64,7 @@ const server = http.createServer(async (request, response) => {
       const text = input.text?.trim();
       if (!text) return writeJson(response, 400, { error: "text is required" });
       if (text.length > 4000) return writeJson(response, 400, { error: "text exceeds 4000 chars" });
-      const audio = await synthesizeSpeech(text, inworldTtsAgentVoice);
+      const audio = await synthesizeAgentSpeech(text);
       response.writeHead(200, {
         "Content-Type": "audio/wav",
         "Content-Length": audio.byteLength,
@@ -206,7 +208,7 @@ const fillerCache = [];
 async function warmFillers() {
   for (const phrase of FILLER_PHRASES) {
     try {
-      const wav = await synthesizeSpeech(phrase, inworldTtsAgentVoice);
+      const wav = await synthesizeAgentSpeech(phrase);
       fillerCache.push(wav.toString("base64"));
     } catch (error) {
       console.warn("Filler TTS warmup failed:", error.message);
@@ -220,17 +222,22 @@ function randomFiller() {
   return fillerCache[Math.floor(Math.random() * fillerCache.length)];
 }
 
-// Provider switch: Tenstorrent when configured (Inworld fallback), else Inworld.
-async function synthesizeSpeech(text, voiceId) {
+// Ada's own voice: Inworld (reliable, handles the conversation volume).
+async function synthesizeAgentSpeech(text) {
+  return synthesizeInworldSpeech(text, inworldTtsAgentVoice);
+}
+
+// Sponsor voice for ad copy: Tenstorrent (a distinct voice). On error or quota,
+// fall back to a different Inworld voice so ads still sound distinct from Ada.
+async function synthesizeSponsorSpeech(text) {
   if (tenstorrentApiKey) {
     try {
-      return await synthesizeTenstorrentSpeech(text, voiceId);
+      return await synthesizeTenstorrentSpeech(text, sponsorVoice || inworldSponsorVoice);
     } catch (error) {
-      if (!inworldApiKey) throw error;
-      console.warn("Tenstorrent TTS failed, falling back to Inworld:", error.message);
+      console.warn("Tenstorrent sponsor TTS failed, using Inworld:", error.message);
     }
   }
-  return synthesizeInworldSpeech(text, voiceId);
+  return synthesizeInworldSpeech(text, inworldSponsorVoice);
 }
 
 // Tenstorrent OpenAI-compatible TTS. Input is capped (~150–180 words), so long
@@ -321,6 +328,77 @@ function buildWav({ sampleRate, channels, bits }, pcm) {
   return Buffer.concat([header, pcm]);
 }
 
+// Sponsor voice for ad copy — a different voice than the agent. Discovered from
+// Tenstorrent's voice list, or set via TTS_SPONSOR_VOICE.
+let sponsorVoice = process.env.TTS_SPONSOR_VOICE?.trim() || "";
+
+async function discoverVoices() {
+  if (tenstorrentApiKey) {
+    try {
+      const res = await fetch(
+        `${tenstorrentBaseUrl}/v1/audio/voices?model=${encodeURIComponent(tenstorrentTtsModel)}`,
+        { headers: { Authorization: `Bearer ${tenstorrentApiKey}` }, signal: AbortSignal.timeout(10000) },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const ids = (data.voices || []).map((v) => v.voice_id).filter(Boolean);
+      if (ids.length && (!sponsorVoice || !ids.includes(sponsorVoice) || sponsorVoice === inworldTtsAgentVoice)) {
+        sponsorVoice = ids.find((id) => id !== inworldTtsAgentVoice) || inworldTtsAgentVoice;
+      }
+    } catch (error) {
+      console.warn("Voice discovery failed:", error.message);
+    }
+  }
+  if (!sponsorVoice) sponsorVoice = inworldTtsAgentVoice;
+  console.log(`TTS voices: agent=${inworldTtsAgentVoice} sponsor=${sponsorVoice}`);
+}
+
+// Split a reply into [{text, ad}] on <ad>…</ad> markers so ad copy can be voiced
+// with the sponsor voice while the agent's own words use the agent voice.
+function splitAdSegments(text) {
+  const segments = [];
+  const re = /<ad>([\s\S]*?)<\/ad>/gi;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) segments.push({ text: text.slice(last, m.index), ad: false });
+    segments.push({ text: m[1], ad: true });
+    last = re.lastIndex;
+  }
+  if (last < text.length) segments.push({ text: text.slice(last), ad: false });
+  return segments.length ? segments : [{ text, ad: false }];
+}
+
+function stripAdTags(text) {
+  return text.replace(/<\/?ad>/gi, " ").replace(/\s+/g, " ").trim();
+}
+
+// Speak a reply, sending each segment as its own audio message. Ad segments use
+// the sponsor voice. The browser plays segments back-to-back; sending them
+// separately (rather than concatenating) avoids sample-rate mismatch between
+// the Inworld agent voice and the Tenstorrent sponsor voice.
+async function speakReply(send, text) {
+  let segments = splitAdSegments(text).filter((s) => s.text.trim());
+  if (!segments.length) segments = [{ text: stripAdTags(text) || "Okay.", ad: false }];
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i];
+    let audio;
+    try {
+      audio = seg.ad
+        ? await synthesizeSponsorSpeech(seg.text.trim())
+        : await synthesizeAgentSpeech(seg.text.trim());
+    } catch {
+      audio = await synthesizeAgentSpeech(seg.text.trim());
+    }
+    send({
+      type: "agent_audio",
+      format: "wav",
+      data: audio.toString("base64"),
+      final: i === segments.length - 1,
+    });
+  }
+}
+
 // --- WebSocket routing ---------------------------------------------------------
 
 const browserVoiceServer = new WebSocketServer({ noServer: true });
@@ -378,14 +456,13 @@ browserVoiceServer.on("connection", (client) => {
         conversationId = reply.conversationId;
         send({
           type: "agent_text",
-          text: reply.text,
+          text: stripAdTags(reply.text),
           emotion: reply.emotion,
           satisfaction: reply.satisfaction,
           offerPreference: reply.offerPreference,
         });
         setState("speaking");
-        const audio = await synthesizeSpeech(reply.text, inworldTtsAgentVoice);
-        send({ type: "agent_audio", format: "wav", data: audio.toString("base64") });
+        await speakReply(send, reply.text);
       } catch (error) {
         console.error("Voice turn failed", error.message);
         send({ type: "error", message: error.message });
@@ -414,7 +491,29 @@ browserVoiceServer.on("connection", (client) => {
   client.on("close", () => stt.close());
   client.on("error", () => stt.close());
 
-  setState("listening");
+  // Opening greeting that includes a featured ad, spoken before the user talks.
+  async function greet() {
+    busy = true;
+    setState("thinking");
+    try {
+      const reply = await sendToAgent({
+        baseUrl: wholesaleAgentUrl,
+        conversationId,
+        message:
+          "The customer just connected the call. Greet them warmly in one short "
+          + "sentence and mention one of today's featured sponsored deals.",
+      });
+      conversationId = reply.conversationId;
+      send({ type: "agent_text", text: stripAdTags(reply.text) });
+      setState("speaking");
+      await speakReply(send, reply.text);
+    } catch (error) {
+      console.error("Greeting failed:", error.message);
+      setState("listening");
+      busy = false;
+    }
+  }
+  greet();
 });
 
 // --- Twilio phone STT (optional, no ads): media stream -> Inworld STT ----------
@@ -455,7 +554,7 @@ twilioMediaServer.on("connection", (client) => {
 server.listen(port, () => {
   console.log(`Voice sales agent listening on http://localhost:${port}  (open /voice)`);
   console.log(`Agent backend: ${wholesaleAgentUrl}`);
-  warmFillers(); // pre-synthesize fillers so they play instantly on the first turn
+  discoverVoices().then(warmFillers); // pick sponsor voice, then pre-synth fillers
   if (twilioAuthToken && publicBaseUrl) {
     console.log(`Twilio media stream enabled at ${publicBaseUrl.replace(/^http/, "ws")}/twilio/media`);
   }

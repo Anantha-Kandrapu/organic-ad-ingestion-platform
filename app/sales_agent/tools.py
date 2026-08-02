@@ -419,6 +419,26 @@ def make_tools(conversation_id: int) -> list:
                     "product": "Potato Chips Salted 50g",
                     "message": "Featured: Potato Chips at the week's lowest bulk price.",
                 },
+                {
+                    "sponsor": "Cola Classic",
+                    "product": "Cola Classic 330ml",
+                    "message": "Sponsored: buy 2 cola pallets today, get a third at 20% off.",
+                },
+                {
+                    "sponsor": "GoldenGrain",
+                    "product": "Basmati Rice 5kg",
+                    "message": "This week: Basmati Rice pallets ship with a free display stand.",
+                },
+                {
+                    "sponsor": "NuttyCo",
+                    "category": "Snacks",
+                    "message": "Featured: Mixed Nuts — spend $200 on snacks and get 8% back.",
+                },
+                {
+                    "sponsor": "Corner Shop Rewards",
+                    "category": "any",
+                    "message": "New this month: earn 2% store credit on every order over $300.",
+                },
             ]
         })
 
