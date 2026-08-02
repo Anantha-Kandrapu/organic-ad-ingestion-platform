@@ -3,62 +3,38 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
 import { twilioMulaw8kToLinear16k } from "./audio.js";
-import {
-  loadProductCatalog,
-  selectRandomSponsoredProduct,
-  selectSponsoredProduct,
-} from "./ads.js";
-import { composeDemoTurn } from "./composer.js";
-import {
-  buildGatherTwiML,
-  buildRetryTwiML,
-  buildSpokenTurnTwiML,
-  parseSpokenBudget,
-} from "./voice-demo.js";
-import { getWholesaleResponse } from "./wholesale-client.js";
+import { sendToAgent } from "./agent-client.js";
 
-const requiredEnvironment = ["INWORLD_API_KEY", "TWILIO_AUTH_TOKEN", "PUBLIC_BASE_URL"];
+const requiredEnvironment = ["INWORLD_API_KEY"];
 const missingEnvironment = requiredEnvironment.filter((name) => !process.env[name]?.trim());
-
 if (missingEnvironment.length > 0) {
   console.error(`Missing required environment variables: ${missingEnvironment.join(", ")}`);
   process.exit(1);
 }
 
 const port = Number(process.env.PORT || 8080);
-const publicBaseUrl = process.env.PUBLIC_BASE_URL.replace(/\/$/, "");
-const publicWebSocketBaseUrl = publicBaseUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const inworldApiKey = process.env.INWORLD_API_KEY;
 const inworldTtsModel = process.env.INWORLD_TTS_MODEL?.trim() || "inworld-tts-2";
-const inworldTtsSponsorVoice = process.env.INWORLD_TTS_SPONSOR_VOICE?.trim() || "Dennis";
 const inworldTtsAgentVoice = process.env.INWORLD_TTS_AGENT_VOICE?.trim() || "Ashley";
 const sttLanguage = process.env.STT_LANGUAGE || "en-US";
+const wholesaleAgentUrl = (process.env.WHOLESALE_AGENT_URL?.trim() || "http://127.0.0.1:8000");
 const transcriptWebhookUrl = process.env.TRANSCRIPT_WEBHOOK_URL?.trim();
 const transcriptWebhookBearer = process.env.TRANSCRIPT_WEBHOOK_BEARER?.trim();
-const adApiBearer = process.env.AD_API_BEARER?.trim();
-const voiceMode = process.env.VOICE_MODE?.trim() || "demo";
-const wholesaleAgentUrl = process.env.WHOLESALE_AGENT_URL?.trim();
-const productCatalogPath = process.env.PRODUCT_CATALOG_PATH
-  || new URL("../data/products/brightdata-amazon-2026-08-01.products.json", import.meta.url);
-const adFrequencyCap = Number(process.env.AD_FREQUENCY_CAP || 2);
-if (!Number.isInteger(adFrequencyCap) || adFrequencyCap < 1) {
-  throw new Error("AD_FREQUENCY_CAP must be a positive integer");
-}
-const products = await loadProductCatalog(productCatalogPath);
-const adSessions = new Map();
-let lastDemoSponsoredAsin;
-const demoAssets = {
-  "/": ["demo.html", "text/html; charset=utf-8"],
-  "/demo": ["demo.html", "text/html; charset=utf-8"],
-  "/demo.css": ["demo.css", "text/css; charset=utf-8"],
-  "/demo.js": ["demo.js", "text/javascript; charset=utf-8"],
+// Twilio phone STT is optional; enabled only when an auth token is present.
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN?.trim();
+const publicBaseUrl = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, "");
+
+const staticAssets = {
+  "/": ["voice.html", "text/html; charset=utf-8"],
+  "/voice": ["voice.html", "text/html; charset=utf-8"],
+  "/voice.js": ["voice.js", "text/javascript; charset=utf-8"],
+  "/voice.css": ["voice.css", "text/css; charset=utf-8"],
 };
 
 const server = http.createServer(async (request, response) => {
   try {
-    if (request.method === "GET" && demoAssets[request.url]) {
-      const [fileName, contentType] = demoAssets[request.url];
+    if (request.method === "GET" && staticAssets[request.url]) {
+      const [fileName, contentType] = staticAssets[request.url];
       const contents = await readFile(new URL(`../public/${fileName}`, import.meta.url));
       response.writeHead(200, { "Content-Type": contentType });
       response.end(contents);
@@ -68,216 +44,108 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       return writeJson(response, 200, {
         status: "ok",
-        model: "inworld/inworld-stt-1",
-        products: products.length,
+        stt: "inworld/inworld-stt-1",
+        tts: inworldTtsModel,
+        agent: wholesaleAgentUrl,
       });
     }
 
-    if (request.method === "POST" && request.url === "/ads/select") {
-      if (adApiBearer && request.headers.authorization !== `Bearer ${adApiBearer}`) {
-        return writeJson(response, 401, { error: "Invalid ad API credential" });
-      }
-      const input = await readJsonBody(request);
-      const callSid = input.callSid?.trim();
-      if (!callSid) return writeJson(response, 400, { error: "callSid is required" });
-      if (input.rejectedAsins != null && !Array.isArray(input.rejectedAsins)) {
-        return writeJson(response, 400, { error: "rejectedAsins must be an array" });
-      }
-
-      const session = getAdSession(callSid);
-      for (const asin of input.rejectedAsins || []) session.rejectedAsins.add(asin);
-      if (session.decisions >= adFrequencyCap) {
-        return writeJson(response, 200, {
-          type: "ad.selection",
-          eligible: false,
-          reason: "frequency_cap",
-        });
-      }
-
-      const selection = selectSponsoredProduct(products, {
-        ...input,
-        rejectedAsins: [...session.rejectedAsins],
-        shownAsins: [...session.shownAsins],
-      });
-      if (!selection) {
-        return writeJson(response, 200, {
-          type: "ad.selection",
-          eligible: false,
-          reason: "no_match",
-        });
-      }
-
-      session.shownAsins.add(selection.product.asin);
-      session.decisions += 1;
-      session.updatedAt = Date.now();
-      console.log(JSON.stringify({
-        type: "ad.decision",
-        callSid,
-        asin: selection.product.asin,
-        disclosure: selection.disclosure,
-        occurredAt: new Date().toISOString(),
-      }));
-      return writeJson(response, 200, { callSid, ...selection });
-    }
-
-    if (request.method === "POST" && request.url === "/api/demo/sponsor") {
-      const input = await readJsonBody(request);
-      const callSid = input.callSid?.trim();
-      if (!callSid) return writeJson(response, 400, { error: "callSid is required" });
-
-      const selection = selectRandomSponsoredProduct(
-        products,
-        lastDemoSponsoredAsin ? [lastDemoSponsoredAsin] : [],
-      );
-      if (!selection) return writeJson(response, 404, { error: "No sponsored inventory available" });
-      lastDemoSponsoredAsin = selection.product.asin;
-
-      const injectedAd = {
-        id: `ad_${crypto.randomUUID()}`,
-        type: "injected_ad",
-        source: "ad_engine",
-        disclosure: selection.disclosure,
-        text: selection.breakCopy,
-        product: selection.product,
-        match: selection.match,
-      };
-      return writeJson(response, 200, {
-        type: "sponsor_break",
-        callSid,
-        phase: "fetching_web_results",
-        injectedAd,
-        segments: [injectedAd],
-      });
-    }
-
+    // Text-to-speech passthrough (used by the browser to speak agent replies).
     if (request.method === "POST" && request.url === "/api/tts") {
       const input = await readJsonBody(request);
       const text = input.text?.trim();
       if (!text) return writeJson(response, 400, { error: "text is required" });
-      if (text.length > 2000) return writeJson(response, 400, { error: "text exceeds 2,000 characters" });
-      if (input.role !== "sponsor" && input.role !== "agent") {
-        return writeJson(response, 400, { error: "role must be sponsor or agent" });
-      }
-
-      const voiceId = input.role === "sponsor"
-        ? inworldTtsSponsorVoice
-        : inworldTtsAgentVoice;
-      const audio = await synthesizeInworldSpeech(text, voiceId);
+      if (text.length > 4000) return writeJson(response, 400, { error: "text exceeds 4000 chars" });
+      const audio = await synthesizeInworldSpeech(text, inworldTtsAgentVoice);
       response.writeHead(200, {
         "Content-Type": "audio/wav",
         "Content-Length": audio.byteLength,
         "Cache-Control": "no-store",
-        "X-TTS-Provider": "inworld",
-        "X-TTS-Model": inworldTtsModel,
-        "X-TTS-Voice": voiceId,
       });
       response.end(audio);
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/demo/turn") {
-      const input = await readJsonBody(request);
-      const callSid = input.callSid?.trim();
-      const transcript = input.transcript?.trim();
-      if (!callSid) return writeJson(response, 400, { error: "callSid is required" });
-      if (!transcript) return writeJson(response, 400, { error: "transcript is required" });
-
-      const selection = input.suppressAd
-        ? { eligible: false, reason: "sponsor_break_already_served" }
-        : selectSponsoredProduct(products, {
-          intent: transcript,
-          maxPrice: input.maxPrice,
-        });
-      const turnId = `turn_${crypto.randomUUID()}`;
-      const wholesale = await tryWholesaleResponse(transcript);
-      const turn = composeDemoTurn({
-        callSid,
-        transcript,
-        turnId,
-        llmText: wholesale?.text,
-        selection: selection || { eligible: false, reason: "no_match" },
-      });
-      console.log(JSON.stringify({
-        type: "demo.turn",
-        turnId,
-        callSid,
-        injectionHappened: turn.injection.happened,
-        segmentTypes: turn.segments.map((segment) => segment.type),
-      }));
-      return writeJson(response, 200, turn);
-    }
-
-    if (request.method === "POST" && request.url === "/twilio/voice") {
-      const body = await readRequestBody(request);
-      const params = Object.fromEntries(new URLSearchParams(body));
-      const exactUrl = `${publicBaseUrl}/twilio/voice`;
-
-      if (!isValidTwilioSignature(request.headers["x-twilio-signature"], exactUrl, params)) {
-        return writeJson(response, 403, { error: "Invalid Twilio signature" });
-      }
-
-      if (voiceMode === "demo") {
-        return writeXml(response, 200, buildGatherTwiML({
-          actionUrl: `${publicBaseUrl}/twilio/respond`,
-        }));
-      }
-
-      const streamUrl = `${publicWebSocketBaseUrl}/twilio/media`;
-      response.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
-      response.end(
-        `<?xml version="1.0" encoding="UTF-8"?>` +
-          `<Response><Connect><Stream url="${escapeXml(streamUrl)}" /></Connect></Response>`,
-      );
-      return;
-    }
-
-    if (request.method === "POST" && request.url === "/twilio/respond") {
-      const body = await readRequestBody(request);
-      const params = Object.fromEntries(new URLSearchParams(body));
-      const exactUrl = `${publicBaseUrl}/twilio/respond`;
-      if (!isValidTwilioSignature(request.headers["x-twilio-signature"], exactUrl, params)) {
-        return writeJson(response, 403, { error: "Invalid Twilio signature" });
-      }
-
-      const transcript = params.SpeechResult?.trim();
-      if (!transcript) {
-        return writeXml(response, 200, buildRetryTwiML({
-          voiceUrl: `${publicBaseUrl}/twilio/voice`,
-        }));
-      }
-
-      const callSid = params.CallSid || `call_${crypto.randomUUID()}`;
-      const selection = selectSponsoredProduct(products, {
-        intent: transcript,
-        maxPrice: parseSpokenBudget(transcript),
-      });
-      const wholesale = await tryWholesaleResponse(transcript);
-      const turn = composeDemoTurn({
-        callSid,
-        transcript,
-        turnId: `turn_${crypto.randomUUID()}`,
-        selection: selection || { eligible: false, reason: "no_match" },
-        llmText: wholesale?.text,
-      });
-      console.log(JSON.stringify({
-        type: "voice.demo.turn",
-        callSid,
-        transcript,
-        injectionHappened: turn.injection.happened,
-        segmentTypes: turn.segments.map((segment) => segment.type),
-      }));
-      return writeXml(response, 200, buildSpokenTurnTwiML(turn));
-    }
-
     writeJson(response, 404, { error: "Not found" });
   } catch (error) {
-    if (error instanceof TypeError) {
-      return writeJson(response, 400, { error: error.message });
-    }
+    if (error instanceof TypeError) return writeJson(response, 400, { error: error.message });
     console.error("HTTP error", error);
     writeJson(response, 500, { error: "Internal server error" });
   }
 });
+
+// --- Inworld streaming STT session (shared by browser + Twilio) ----------------
+
+function createInworldSttSession({ onTranscript, onError }) {
+  const socket = new WebSocket(
+    "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional",
+    { headers: { Authorization: `Basic ${inworldApiKey}` } },
+  );
+  let ready = false;
+  let closing = false;
+  const pending = [];
+
+  socket.on("open", () => {
+    socket.send(JSON.stringify({
+      transcribeConfig: {
+        modelId: "inworld/inworld-stt-1",
+        language: sttLanguage,
+        audioEncoding: "LINEAR16",
+        sampleRateHertz: 16000,
+        numberOfChannels: 1,
+      },
+    }));
+    ready = true;
+    while (pending.length > 0 && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ audioChunk: { content: pending.shift() } }));
+    }
+  });
+
+  socket.on("message", (raw) => {
+    let event;
+    try {
+      event = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    // Inworld wraps every event in `result`: transcription, speechStarted/Stopped, usage.
+    const transcription = event.result?.transcription;
+    if (transcription) {
+      onTranscript({
+        text: transcription.transcript || "",
+        isFinal: Boolean(transcription.isFinal),
+      });
+    } else if (event.error || event.result?.error) {
+      console.error("Inworld STT error", event.error || event.result?.error);
+    }
+  });
+
+  socket.on("error", (error) => {
+    console.error("Inworld STT socket error", error.message);
+    onError?.(error);
+  });
+
+  return {
+    sendPcmBase64(base64Linear16) {
+      if (closing) return;
+      if (ready && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ audioChunk: { content: base64Linear16 } }));
+      } else if (pending.length < 400) {
+        pending.push(base64Linear16);
+      }
+    },
+    close() {
+      if (closing) return;
+      closing = true;
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ closeStream: {} }));
+        setTimeout(() => socket.close(1000), 500).unref();
+      } else if (socket.readyState === WebSocket.CONNECTING) {
+        socket.close();
+      }
+    },
+  };
+}
 
 async function synthesizeInworldSpeech(text, voiceId) {
   const ttsResponse = await fetch("https://api.inworld.ai/tts/v1/voice", {
@@ -290,10 +158,7 @@ async function synthesizeInworldSpeech(text, voiceId) {
       text,
       voiceId,
       modelId: inworldTtsModel,
-      audioConfig: {
-        audioEncoding: "LINEAR16",
-        sampleRateHertz: 22050,
-      },
+      audioConfig: { audioEncoding: "LINEAR16", sampleRateHertz: 22050 },
       deliveryMode: "BALANCED",
       applyTextNormalization: "ON",
     }),
@@ -307,147 +172,140 @@ async function synthesizeInworldSpeech(text, voiceId) {
   return Buffer.from(payload.audioContent, "base64");
 }
 
-const twilioWebSocketServer = new WebSocketServer({ noServer: true });
+// --- WebSocket routing ---------------------------------------------------------
+
+const browserVoiceServer = new WebSocketServer({ noServer: true });
+const twilioMediaServer = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
   const path = new URL(request.url, "http://localhost").pathname;
-  if (path !== "/twilio/media") {
+  if (path === "/voice/media") {
+    browserVoiceServer.handleUpgrade(request, socket, head, (client) => {
+      browserVoiceServer.emit("connection", client, request);
+    });
+  } else if (path === "/twilio/media" && twilioAuthToken) {
+    twilioMediaServer.handleUpgrade(request, socket, head, (client) => {
+      twilioMediaServer.emit("connection", client, request);
+    });
+  } else {
     socket.destroy();
-    return;
   }
-
-  const exactUrl = `${publicWebSocketBaseUrl}/twilio/media`;
-  const signature = request.headers["x-twilio-signature"];
-  if (!isValidTwilioSignature(signature, exactUrl, {})) {
-    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-
-  twilioWebSocketServer.handleUpgrade(request, socket, head, (twilioSocket) => {
-    twilioWebSocketServer.emit("connection", twilioSocket, request);
-  });
 });
 
-twilioWebSocketServer.on("connection", (twilioSocket) => {
-  const inworldSocket = new WebSocket(
-    "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional",
-    { headers: { Authorization: `Basic ${inworldApiKey}` } },
-  );
+// --- Browser continuous voice loop: mic -> STT -> agent -> TTS -> browser ------
 
+browserVoiceServer.on("connection", (client) => {
+  let conversationId = null;
+  let assistantCount = 0;
+  let busy = false; // true while the agent is thinking / speaking
+  const send = (message) => {
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(message));
+  };
+
+  const stt = createInworldSttSession({
+    onTranscript: async ({ text, isFinal }) => {
+      if (!text.trim()) return;
+      if (!isFinal) {
+        send({ type: "partial_transcript", text });
+        return;
+      }
+      if (busy) return; // ignore speech captured while the agent is responding
+      busy = true;
+      send({ type: "user_transcript", text });
+      send({ type: "status", state: "thinking" });
+      try {
+        const reply = await sendToAgent({
+          baseUrl: wholesaleAgentUrl,
+          conversationId,
+          priorAssistantCount: assistantCount,
+          message: text,
+        });
+        conversationId = reply.conversationId;
+        assistantCount = reply.assistantCount;
+        send({
+          type: "agent_text",
+          text: reply.text,
+          emotion: reply.emotion,
+          satisfaction: reply.satisfaction,
+          offerPreference: reply.offerPreference,
+        });
+        send({ type: "status", state: "speaking" });
+        const audio = await synthesizeInworldSpeech(reply.text, inworldTtsAgentVoice);
+        send({ type: "agent_audio", format: "wav", data: audio.toString("base64") });
+      } catch (error) {
+        console.error("Voice turn failed", error.message);
+        send({ type: "error", message: error.message });
+        send({ type: "status", state: "listening" });
+        busy = false;
+      }
+    },
+    onError: (error) => send({ type: "error", message: `STT: ${error.message}` }),
+  });
+
+  client.on("message", (raw) => {
+    let event;
+    try {
+      event = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (event.type === "audio" && typeof event.data === "string") {
+      if (!busy) stt.sendPcmBase64(event.data); // don't feed mic audio while speaking
+    } else if (event.type === "playback_done") {
+      // Browser finished playing the reply; resume listening.
+      busy = false;
+      send({ type: "status", state: "listening" });
+    }
+  });
+
+  client.on("close", () => stt.close());
+  client.on("error", () => stt.close());
+
+  send({ type: "status", state: "listening" });
+});
+
+// --- Twilio phone STT (optional, no ads): media stream -> Inworld STT ----------
+
+twilioMediaServer.on("connection", (client) => {
   let streamSid;
   let callSid;
-  let inworldReady = false;
-  let streamClosing = false;
-  const pendingAudio = [];
-
-  inworldSocket.on("open", () => {
-    inworldSocket.send(JSON.stringify({
-      transcribeConfig: {
-        modelId: "inworld/inworld-stt-1",
-        language: sttLanguage,
-        audioEncoding: "LINEAR16",
-        sampleRateHertz: 16000,
-        numberOfChannels: 1,
-      },
-    }));
-    inworldReady = true;
-    while (pendingAudio.length > 0 && inworldSocket.readyState === WebSocket.OPEN) {
-      sendAudioToInworld(inworldSocket, pendingAudio.shift());
-    }
+  const stt = createInworldSttSession({
+    onTranscript: ({ text, isFinal }) => {
+      if (!text.trim()) return;
+      const event = { callSid, streamSid, text, isFinal, receivedAt: new Date().toISOString() };
+      console.log(JSON.stringify({ type: "transcription", ...event }));
+      if (isFinal) deliverTranscript(event).catch((e) => console.error("webhook failed", e.message));
+    },
+    onError: () => client.close(1011, "STT error"),
   });
 
-  inworldSocket.on("message", (raw) => {
+  client.on("message", (raw) => {
     let event;
     try {
       event = JSON.parse(raw.toString());
     } catch {
-      console.warn("Ignored non-JSON Inworld message");
       return;
     }
-
-    if (event.transcription) {
-      const transcriptEvent = {
-        callSid,
-        streamSid,
-        text: event.transcription.transcript || "",
-        isFinal: Boolean(event.transcription.isFinal),
-        wordTimestamps: event.transcription.wordTimestamps || [],
-        receivedAt: new Date().toISOString(),
-      };
-      console.log(JSON.stringify({ type: "transcription", ...transcriptEvent }));
-      deliverTranscript(transcriptEvent).catch((error) => {
-        console.error("Transcript webhook failed", error.message);
-      });
-    } else if (event.code || event.error) {
-      console.error("Inworld STT error", event);
-    }
-  });
-
-  inworldSocket.on("error", (error) => {
-    console.error("Inworld WebSocket error", { callSid, message: error.message });
-    twilioSocket.close(1011, "STT provider error");
-  });
-
-  inworldSocket.on("close", () => {
-    if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close(1011, "STT stream closed");
-  });
-
-  twilioSocket.on("message", (raw) => {
-    let event;
-    try {
-      event = JSON.parse(raw.toString());
-    } catch {
-      console.warn("Ignored malformed Twilio message");
-      return;
-    }
-
     if (event.event === "start") {
       streamSid = event.start?.streamSid;
       callSid = event.start?.callSid;
-      console.log(JSON.stringify({ type: "call.started", callSid, streamSid }));
-      return;
+    } else if (event.event === "media" && event.media?.payload) {
+      stt.sendPcmBase64(twilioMulaw8kToLinear16k(event.media.payload));
+    } else if (event.event === "stop") {
+      stt.close();
     }
-
-    if (event.event === "media" && event.media?.payload) {
-      const linear16kAudio = twilioMulaw8kToLinear16k(event.media.payload);
-      if (inworldReady && inworldSocket.readyState === WebSocket.OPEN) {
-        sendAudioToInworld(inworldSocket, linear16kAudio);
-      } else if (pendingAudio.length < 250) {
-        pendingAudio.push(linear16kAudio);
-      }
-      return;
-    }
-
-    if (event.event === "stop") closeInworldStream();
   });
-
-  twilioSocket.on("close", closeInworldStream);
-  twilioSocket.on("error", (error) => {
-    console.error("Twilio WebSocket error", { callSid, message: error.message });
-    closeInworldStream();
-  });
-
-  function closeInworldStream() {
-    if (streamClosing) return;
-    streamClosing = true;
-    if (inworldSocket.readyState === WebSocket.OPEN) {
-      inworldSocket.send(JSON.stringify({ closeStream: {} }));
-      setTimeout(() => inworldSocket.close(1000), 1000).unref();
-    } else if (inworldSocket.readyState === WebSocket.CONNECTING) {
-      inworldSocket.close();
-    }
-  }
+  client.on("close", () => stt.close());
+  client.on("error", () => stt.close());
 });
 
 server.listen(port, () => {
-  console.log(`Phone-call STT bridge listening on port ${port}`);
-  console.log(`Configure Twilio inbound voice webhook: ${publicBaseUrl}/twilio/voice`);
+  console.log(`Voice sales agent listening on http://localhost:${port}  (open /voice)`);
+  console.log(`Agent backend: ${wholesaleAgentUrl}`);
+  if (twilioAuthToken && publicBaseUrl) {
+    console.log(`Twilio media stream enabled at ${publicBaseUrl.replace(/^http/, "ws")}/twilio/media`);
+  }
 });
-
-function sendAudioToInworld(socket, base64Linear16Audio) {
-  socket.send(JSON.stringify({ audioChunk: { content: base64Linear16Audio } }));
-}
 
 async function deliverTranscript(event) {
   if (!transcriptWebhookUrl) return;
@@ -462,89 +320,26 @@ async function deliverTranscript(event) {
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
 }
 
-async function tryWholesaleResponse(message) {
-  if (!wholesaleAgentUrl) return null;
-  try {
-    return await getWholesaleResponse({ baseUrl: wholesaleAgentUrl, message });
-  } catch (error) {
-    console.warn("Wholesale agent unavailable; using demo response", { message: error.message });
-    return null;
-  }
-}
-
-function isValidTwilioSignature(providedSignature, exactUrl, params) {
-  if (!providedSignature) return false;
-  const sortedKeys = Object.keys(params).sort();
-  const payload = sortedKeys.reduce((value, key) => value + key + params[key], exactUrl);
-  const expected = crypto.createHmac("sha1", twilioAuthToken).update(payload).digest("base64");
-  const provided = Buffer.from(providedSignature);
-  const wanted = Buffer.from(expected);
-  return provided.length === wanted.length && crypto.timingSafeEqual(provided, wanted);
-}
-
-function readRequestBody(request) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let bytes = 0;
-    request.on("data", (chunk) => {
-      bytes += chunk.length;
-      if (bytes > 64 * 1024) {
-        reject(new Error("Request body too large"));
-        request.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    request.on("error", reject);
-  });
-}
-
-async function readJsonBody(request) {
-  const body = await readRequestBody(request);
-  try {
-    return JSON.parse(body);
-  } catch {
-    throw new TypeError("Invalid JSON body");
-  }
-}
-
-function getAdSession(callSid) {
-  const now = Date.now();
-  for (const [sessionCallSid, session] of adSessions) {
-    if (now - session.updatedAt > 4 * 60 * 60 * 1000) adSessions.delete(sessionCallSid);
-  }
-  const existing = adSessions.get(callSid);
-  if (existing) return existing;
-
-  const session = {
-    decisions: 0,
-    shownAsins: new Set(),
-    rejectedAsins: new Set(),
-    updatedAt: now,
-  };
-  adSessions.set(callSid, session);
-  return session;
-}
-
 function writeJson(response, status, body) {
   if (response.headersSent) return;
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
 }
 
-function writeXml(response, status, body) {
-  if (response.headersSent) return;
-  response.writeHead(status, { "Content-Type": "text/xml; charset=utf-8" });
-  response.end(body);
+async function readJsonBody(request) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > 64 * 1024) throw new TypeError("Request body too large");
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new TypeError("Invalid JSON body");
+  }
 }
 
-function escapeXml(value) {
-  return value.replace(/[<>&"']/g, (character) => ({
-    "<": "&lt;",
-    ">": "&gt;",
-    "&": "&amp;",
-    "\"": "&quot;",
-    "'": "&apos;",
-  })[character]);
-}
+// Silence unused-crypto lint if Twilio validation is later re-added.
+void crypto;

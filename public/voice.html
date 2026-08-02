@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voice Sales Agent — Ada</title>
+    <link rel="stylesheet" href="/voice.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Talk to Ada</h1>
+      <p class="subtitle">Wholesale sales agent · Inworld speech ⇄ Claude</p>
+
+      <div id="status" class="status idle">Idle</div>
+
+      <div class="controls">
+        <button id="toggle" type="button">Start talking</button>
+      </div>
+
+      <p id="partial" class="partial"></p>
+      <div id="log" class="log" aria-live="polite"></div>
+    </main>
+    <script src="/voice.js"></script>
+  </body>
+</html>
