@@ -11,6 +11,10 @@ const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecogni
 
 let recognition;
 let submitting = false;
+let currentCallSid;
+let sponsorPrefetch;
+let sponsorPrefetchText;
+let sponsorPrefetchTimer;
 
 if (SpeechRecognition) {
   recognition = new SpeechRecognition();
@@ -24,6 +28,10 @@ if (SpeechRecognition) {
 
   recognition.addEventListener("start", () => {
     submitting = false;
+    currentCallSid = `VOICE-${Date.now()}`;
+    sponsorPrefetch = null;
+    sponsorPrefetchText = "";
+    clearTimeout(sponsorPrefetchTimer);
     heard.textContent = "";
     micButton.classList.add("listening");
     micLabel.textContent = "Listening";
@@ -39,6 +47,18 @@ if (SpeechRecognition) {
     heard.textContent = transcript ? `“${transcript}”` : "";
 
     const finalResult = event.results[event.results.length - 1].isFinal;
+    clearTimeout(sponsorPrefetchTimer);
+    if (!finalResult && isSponsorIntentReady(transcript)) {
+      sponsorPrefetchTimer = setTimeout(() => {
+        sponsorPrefetchText = transcript;
+        sponsorPrefetch = postJson("/api/demo/sponsor", {
+          callSid: currentCallSid,
+          intent: transcript,
+        }).catch(() => null);
+        status.textContent = "Listening · prefetching a similar sponsor";
+      }, 500);
+    }
+
     if (finalResult && !submitting) {
       submitting = true;
       runVoiceTurn(transcript);
@@ -83,23 +103,34 @@ async function runVoiceTurn(transcript) {
   segments.replaceChildren();
 
   try {
-    const callSid = `VOICE-${Date.now()}`;
-    const sponsorRequest = postJson("/api/demo/sponsor", { callSid });
+    const callSid = currentCallSid || `VOICE-${Date.now()}`;
+    const usePrefetch = sponsorPrefetch && isPrefetchCompatible(sponsorPrefetchText, transcript);
+    const sponsorRequest = usePrefetch ? sponsorPrefetch : postJson("/api/demo/sponsor", {
+      callSid,
+      intent: transcript,
+    });
+    const llmStartedAt = new Date().toISOString();
     const agentRequest = postJson("/api/demo/turn", {
       callSid,
       transcript,
       suppressAd: true,
     });
 
-    const sponsorBreak = await sponsorRequest;
+    const sponsorBreak = await sponsorRequest || await postJson("/api/demo/sponsor", {
+      callSid,
+      intent: transcript,
+    });
     renderSegments(sponsorBreak.segments);
     responsePanel.hidden = false;
-    const timeline = [{ event: "llm_request_started", at: new Date().toISOString() }];
+    const timeline = [
+      { event: "sponsor_prefetched", mode: sponsorBreak.selectionMode, at: sponsorBreak.prefetchedAt },
+      { event: "llm_request_started", at: llmStartedAt },
+    ];
     json.textContent = JSON.stringify({ sponsorBreak, agentTurn: "running_in_parallel", timeline }, null, 2);
     debugPanel.hidden = false;
     status.textContent = "LLM request running in parallel · generating sponsored audio";
     const sponsorAudio = await requestTts(sponsorBreak.injectedAd.text, "sponsor");
-    timeline.push({ event: "sponsor_tts_ready", provider: "inworld", at: new Date().toISOString() });
+    timeline.push({ event: "sponsor_tts_ready", provider: sponsorAudio.provider, at: new Date().toISOString() });
     status.textContent = "LLM request running in parallel · sponsored message playing";
     await playAudio(sponsorAudio);
     timeline.push({ event: "sponsor_finished", at: new Date().toISOString() });
@@ -109,17 +140,16 @@ async function runVoiceTurn(transcript) {
     status.textContent = "Results ready · generating agent audio with Inworld";
     const agentText = agentTurn.segments.map((segment) => segment.text).join(" ");
     const agentAudio = await requestTts(agentText, "agent");
-    timeline.push({ event: "agent_tts_ready", provider: "inworld", at: new Date().toISOString() });
+    timeline.push({ event: "agent_tts_ready", provider: agentAudio.provider, at: new Date().toISOString() });
     const result = {
       type: "voice_llm_with_sponsor",
       input: { type: "caller_transcript", text: transcript },
       sponsorBreak,
       agentTurn,
       tts: {
-        provider: "inworld",
         calls: [
-          { role: "sponsor", voice: sponsorAudio.voice, model: sponsorAudio.model },
-          { role: "agent", voice: agentAudio.voice, model: agentAudio.model },
+          { role: "sponsor", provider: sponsorAudio.provider, voice: sponsorAudio.voice, model: sponsorAudio.model },
+          { role: "agent", provider: agentAudio.provider, voice: agentAudio.voice, model: agentAudio.model },
         ],
       },
       timeline,
@@ -206,4 +236,20 @@ function playAudio(audioAsset) {
 function resetButton() {
   micLabel.textContent = "Start talking";
   micHint.textContent = "Tap to use microphone";
+}
+
+function isSponsorIntentReady(value) {
+  const meaningful = tokens(value);
+  return meaningful.length >= 3
+    && /\b(flight|flights|travel|trip|hotel|vacation|destination|book|booking)\b/i.test(value);
+}
+
+function isPrefetchCompatible(prefetched, finalTranscript) {
+  const prefetchedTokens = new Set(tokens(prefetched));
+  return tokens(finalTranscript).every((token) => prefetchedTokens.has(token));
+}
+
+function tokens(value) {
+  const filler = new Set(["hey", "uh", "um", "like", "can", "could", "you", "me", "please", "want"]);
+  return value.toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 2 && !filler.has(token)) || [];
 }

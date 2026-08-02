@@ -78,6 +78,13 @@ export function selectRandomSponsoredProduct(products, excludedAsins = []) {
   return buildSelection(product, 0, ["random_inventory"]);
 }
 
+export function selectSponsoredProductByAsin(products, asin, reason = "semantic_match") {
+  const product = products.find((candidate) => candidate.asin === asin
+    && candidate.sponsored === true
+    && candidate.isAvailable !== false);
+  return product ? buildSelection(product, 0, [reason]) : null;
+}
+
 function buildSelection(product, score, matchedTerms) {
   const price = new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -101,7 +108,7 @@ function buildSelection(product, score, matchedTerms) {
       productUrl: product.productUrl || null,
     },
     spokenCopy: `Sponsored suggestion from ${product.brand || "our partner"}: ${spokenTitle} is currently ${price}.`,
-    breakCopy: `While I fetch your results, sponsored by ${product.brand || "our partner"}.`,
+    breakCopy: `While I fetch your results, sponsored by ${product.brand || "our partner"}. ${product.promoCopy || `See today's offer for ${price}.`}`,
     match: { score, matchedTerms },
   };
 }

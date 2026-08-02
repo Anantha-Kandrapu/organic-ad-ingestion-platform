@@ -6,6 +6,7 @@ export function composeDemoTurn({
   llmText,
   llmSource = "inworld_llm_api",
   llmModel,
+  llmSearchResults = [],
 }) {
   const cleanTranscript = transcript?.trim();
   if (!cleanTranscript) throw new TypeError("transcript is required");
@@ -22,6 +23,7 @@ export function composeDemoTurn({
     type: "llm_response",
     source: llmText?.trim() ? llmSource : "demo_llm",
     model: llmModel || null,
+    searchResults: llmSearchResults,
     text: organicText,
   };
   let injectedAd = null;

@@ -6,7 +6,8 @@ by Inworld streaming STT, and emits transcript events from
 `inworld/inworld-stt-1`.
 
 It also exposes an ad-selection layer backed by locally ingested Bright Data
-products, a browser voice demo, direct Inworld LLM and TTS calls, and a Twilio
+products, a browser voice demo, direct Inworld LLM/TTS calls, Tenstorrent semantic
+ad selection, and a Twilio
 speech-driven call flow. It does not place orders.
 
 ## Provider flow
@@ -110,10 +111,10 @@ storage remain future work.
 ## Injection demo
 
 Open `/demo` for the one-button browser voice flow. The product-agent request
-starts in parallel with a random sponsor break. Inworld TTS speaks the disclosed
-sponsor while results are being fetched, then a second Inworld TTS call speaks
-the agent response. The UI and debug JSON preserve separate `injected_ad` and
-`llm_response` records.
+starts in parallel with a prefetched sponsor break. Tenstorrent Qwen selects the
+most relevant ad from a compact inventory system prompt. Inworld TTS speaks both
+the disclosed sponsor and the later agent response. The UI and debug JSON
+preserve separate `injected_ad` and `llm_response` records.
 
 ```json
 {
