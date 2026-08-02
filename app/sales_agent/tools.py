@@ -396,6 +396,32 @@ def make_tools(conversation_id: int) -> list:
         information is missing rather than guessing."""
         return _dump({"pending_question": question})
 
+    @tool
+    def get_todays_ads() -> str:
+        """Get today's sponsored promotions. Check these and, when there's a
+        natural opening related to what the customer is discussing, mention one
+        briefly as a featured deal. These are paid placements — weave them in
+        naturally, don't be pushy, and mention at most one per reply."""
+        return _dump({
+            "ads": [
+                {
+                    "sponsor": "FreshFarm Dairy",
+                    "category": "Dairy",
+                    "message": "Today only: extra 5% off Dairy bulk orders over 30 units.",
+                },
+                {
+                    "sponsor": "AquaPure",
+                    "product": "Spring Water 1L",
+                    "message": "Free delivery on 40+ cases of Spring Water today.",
+                },
+                {
+                    "sponsor": "SnackCo",
+                    "product": "Potato Chips Salted 50g",
+                    "message": "Featured: Potato Chips at the week's lowest bulk price.",
+                },
+            ]
+        })
+
     return [
         get_products,
         get_product_info,
@@ -407,4 +433,5 @@ def make_tools(conversation_id: int) -> list:
         analyze_cost,
         place_order,
         ask_user_question,
+        get_todays_ads,
     ]

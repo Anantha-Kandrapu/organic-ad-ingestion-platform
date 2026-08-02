@@ -16,6 +16,12 @@ const port = Number(process.env.PORT || 8080);
 const inworldApiKey = process.env.INWORLD_API_KEY;
 const inworldTtsModel = process.env.INWORLD_TTS_MODEL?.trim() || "inworld-tts-2";
 const inworldTtsAgentVoice = process.env.INWORLD_TTS_AGENT_VOICE?.trim() || "Ashley";
+// Tenstorrent-hosted TTS (Inworld-compatible). When a key is present, agent
+// replies are synthesized on Tenstorrent; otherwise Inworld is called directly.
+const tenstorrentApiKey = process.env.TENSTORRENT_API_KEY?.trim();
+const tenstorrentBaseUrl = (process.env.TENSTORRENT_BASE_URL?.trim()
+  || "https://console.tenstorrent.com").replace(/\/$/, "");
+const tenstorrentTtsModel = process.env.TENSTORRENT_TTS_MODEL?.trim() || "inworld-tts-2";
 const sttLanguage = process.env.STT_LANGUAGE || "en-US";
 const wholesaleAgentUrl = (process.env.WHOLESALE_AGENT_URL?.trim() || "http://127.0.0.1:8000");
 const transcriptWebhookUrl = process.env.TRANSCRIPT_WEBHOOK_URL?.trim();
@@ -45,7 +51,7 @@ const server = http.createServer(async (request, response) => {
       return writeJson(response, 200, {
         status: "ok",
         stt: "inworld/inworld-stt-1",
-        tts: inworldTtsModel,
+        tts: tenstorrentApiKey ? `tenstorrent/${tenstorrentTtsModel}` : inworldTtsModel,
         agent: wholesaleAgentUrl,
       });
     }
@@ -56,7 +62,7 @@ const server = http.createServer(async (request, response) => {
       const text = input.text?.trim();
       if (!text) return writeJson(response, 400, { error: "text is required" });
       if (text.length > 4000) return writeJson(response, 400, { error: "text exceeds 4000 chars" });
-      const audio = await synthesizeInworldSpeech(text, inworldTtsAgentVoice);
+      const audio = await synthesizeSpeech(text, inworldTtsAgentVoice);
       response.writeHead(200, {
         "Content-Type": "audio/wav",
         "Content-Length": audio.byteLength,
@@ -76,14 +82,25 @@ const server = http.createServer(async (request, response) => {
 
 // --- Inworld streaming STT session (shared by browser + Twilio) ----------------
 
-function createInworldSttSession({ onTranscript, onError }) {
+const SILENCE_FRAME = Buffer.alloc(640).toString("base64"); // 320 samples of 16-bit silence
+
+function createInworldSttSession({ onTranscript, onSpeechStarted, onError }) {
   const socket = new WebSocket(
     "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional",
     { headers: { Authorization: `Basic ${inworldApiKey}` } },
   );
   let ready = false;
   let closing = false;
+  let lastActivity = Date.now();
   const pending = [];
+
+  // Keep the socket warm during quiet stretches (e.g. while the agent speaks)
+  // so a long-lived conversation's STT stream doesn't go stale between turns.
+  const keepalive = setInterval(() => {
+    if (socket.readyState === WebSocket.OPEN && Date.now() - lastActivity > 700) {
+      socket.send(JSON.stringify({ audioChunk: { content: SILENCE_FRAME } }));
+    }
+  }, 700);
 
   socket.on("open", () => {
     socket.send(JSON.stringify({
@@ -115,6 +132,8 @@ function createInworldSttSession({ onTranscript, onError }) {
         text: transcription.transcript || "",
         isFinal: Boolean(transcription.isFinal),
       });
+    } else if (event.result?.speechStarted) {
+      onSpeechStarted?.();
     } else if (event.error || event.result?.error) {
       console.error("Inworld STT error", event.error || event.result?.error);
     }
@@ -128,6 +147,7 @@ function createInworldSttSession({ onTranscript, onError }) {
   return {
     sendPcmBase64(base64Linear16) {
       if (closing) return;
+      lastActivity = Date.now();
       if (ready && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ audioChunk: { content: base64Linear16 } }));
       } else if (pending.length < 400) {
@@ -137,6 +157,7 @@ function createInworldSttSession({ onTranscript, onError }) {
     close() {
       if (closing) return;
       closing = true;
+      clearInterval(keepalive);
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ closeStream: {} }));
         setTimeout(() => socket.close(1000), 500).unref();
@@ -172,6 +193,134 @@ async function synthesizeInworldSpeech(text, voiceId) {
   return Buffer.from(payload.audioContent, "base64");
 }
 
+// Short fillers spoken immediately while the real reply is generated, so the
+// gap between the user finishing and the agent answering isn't dead air.
+const FILLER_PHRASES = [
+  "Sure, let me pull that up for you.",
+  "One moment, checking that now.",
+  "Alright, let me take a quick look.",
+  "Okay, give me just a second.",
+];
+const fillerCache = [];
+
+async function warmFillers() {
+  for (const phrase of FILLER_PHRASES) {
+    try {
+      const wav = await synthesizeSpeech(phrase, inworldTtsAgentVoice);
+      fillerCache.push(wav.toString("base64"));
+    } catch (error) {
+      console.warn("Filler TTS warmup failed:", error.message);
+      return;
+    }
+  }
+}
+
+function randomFiller() {
+  if (!fillerCache.length) return null;
+  return fillerCache[Math.floor(Math.random() * fillerCache.length)];
+}
+
+// Provider switch: Tenstorrent when configured (Inworld fallback), else Inworld.
+async function synthesizeSpeech(text, voiceId) {
+  if (tenstorrentApiKey) {
+    try {
+      return await synthesizeTenstorrentSpeech(text, voiceId);
+    } catch (error) {
+      if (!inworldApiKey) throw error;
+      console.warn("Tenstorrent TTS failed, falling back to Inworld:", error.message);
+    }
+  }
+  return synthesizeInworldSpeech(text, voiceId);
+}
+
+// Tenstorrent OpenAI-compatible TTS. Input is capped (~150–180 words), so long
+// replies are split into chunks and the returned WAVs are concatenated.
+async function synthesizeTenstorrentSpeech(text, voiceId) {
+  const wavs = [];
+  for (const chunk of chunkForTts(text, 130)) {
+    const response = await fetch(`${tenstorrentBaseUrl}/v1/audio/speech`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tenstorrentApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: tenstorrentTtsModel,
+        input: chunk,
+        voice: voiceId,
+        response_format: "wav",
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`Tenstorrent TTS HTTP ${response.status} ${detail.slice(0, 200)}`);
+    }
+    wavs.push(Buffer.from(await response.arrayBuffer()));
+  }
+  if (wavs.length <= 1) return wavs[0] || Buffer.alloc(0);
+  const parts = wavs.map(parseWav);
+  return buildWav(parts[0], Buffer.concat(parts.map((p) => p.pcm)));
+}
+
+function chunkForTts(text, maxWords) {
+  const sentences = text.match(/[^.!?\n]+[.!?\n]*\s*/g) || [text];
+  const chunks = [];
+  let current = "";
+  let words = 0;
+  for (const sentence of sentences) {
+    const count = sentence.trim().split(/\s+/).filter(Boolean).length;
+    if (words + count > maxWords && current) {
+      chunks.push(current.trim());
+      current = "";
+      words = 0;
+    }
+    current += sentence;
+    words += count;
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.length ? chunks : [text];
+}
+
+function parseWav(buf) {
+  let offset = 12;
+  let sampleRate = 22050;
+  let channels = 1;
+  let bits = 16;
+  let pcm = Buffer.alloc(0);
+  while (offset + 8 <= buf.length) {
+    const id = buf.toString("ascii", offset, offset + 4);
+    const size = buf.readUInt32LE(offset + 4);
+    if (id === "fmt ") {
+      channels = buf.readUInt16LE(offset + 10);
+      sampleRate = buf.readUInt32LE(offset + 12);
+      bits = buf.readUInt16LE(offset + 22);
+    } else if (id === "data") {
+      pcm = buf.subarray(offset + 8, offset + 8 + size);
+    }
+    offset += 8 + size + (size % 2);
+  }
+  return { sampleRate, channels, bits, pcm };
+}
+
+function buildWav({ sampleRate, channels, bits }, pcm) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE((sampleRate * channels * bits) / 8, 28);
+  header.writeUInt16LE((channels * bits) / 8, 32);
+  header.writeUInt16LE(bits, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
 // --- WebSocket routing ---------------------------------------------------------
 
 const browserVoiceServer = new WebSocketServer({ noServer: true });
@@ -196,32 +345,37 @@ server.on("upgrade", (request, socket, head) => {
 
 browserVoiceServer.on("connection", (client) => {
   let conversationId = null;
-  let assistantCount = 0;
-  let busy = false; // true while the agent is thinking / speaking
+  let busy = false; // agent is thinking/speaking; input is ignored until it finishes
+
   const send = (message) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(message));
   };
+  const setState = (state) => send({ type: "status", state });
 
+  // Turn-based: transcribe the user, run one agent turn, speak it, then listen
+  // again. The mic is ignored while the agent is responding (no interruptions).
   const stt = createInworldSttSession({
     onTranscript: async ({ text, isFinal }) => {
-      if (!text.trim()) return;
+      const clean = text.trim();
+      if (!clean) return;
       if (!isFinal) {
-        send({ type: "partial_transcript", text });
+        send({ type: "partial_transcript", text: clean });
         return;
       }
-      if (busy) return; // ignore speech captured while the agent is responding
+      if (busy || !isMeaningful(clean)) return; // one turn at a time; ignore noise
       busy = true;
-      send({ type: "user_transcript", text });
-      send({ type: "status", state: "thinking" });
+      send({ type: "user_transcript", text: clean });
+      setState("thinking");
+      // Play a filler right away to cover the STT → agent → TTS gap.
+      const filler = randomFiller();
+      if (filler) send({ type: "agent_audio", filler: true, data: filler });
       try {
         const reply = await sendToAgent({
           baseUrl: wholesaleAgentUrl,
           conversationId,
-          priorAssistantCount: assistantCount,
-          message: text,
+          message: clean,
         });
         conversationId = reply.conversationId;
-        assistantCount = reply.assistantCount;
         send({
           type: "agent_text",
           text: reply.text,
@@ -229,13 +383,13 @@ browserVoiceServer.on("connection", (client) => {
           satisfaction: reply.satisfaction,
           offerPreference: reply.offerPreference,
         });
-        send({ type: "status", state: "speaking" });
-        const audio = await synthesizeInworldSpeech(reply.text, inworldTtsAgentVoice);
+        setState("speaking");
+        const audio = await synthesizeSpeech(reply.text, inworldTtsAgentVoice);
         send({ type: "agent_audio", format: "wav", data: audio.toString("base64") });
       } catch (error) {
         console.error("Voice turn failed", error.message);
         send({ type: "error", message: error.message });
-        send({ type: "status", state: "listening" });
+        setState("listening");
         busy = false;
       }
     },
@@ -250,18 +404,17 @@ browserVoiceServer.on("connection", (client) => {
       return;
     }
     if (event.type === "audio" && typeof event.data === "string") {
-      if (!busy) stt.sendPcmBase64(event.data); // don't feed mic audio while speaking
+      if (!busy) stt.sendPcmBase64(event.data); // don't listen while the agent responds
     } else if (event.type === "playback_done") {
-      // Browser finished playing the reply; resume listening.
       busy = false;
-      send({ type: "status", state: "listening" });
+      setState("listening");
     }
   });
 
   client.on("close", () => stt.close());
   client.on("error", () => stt.close());
 
-  send({ type: "status", state: "listening" });
+  setState("listening");
 });
 
 // --- Twilio phone STT (optional, no ads): media stream -> Inworld STT ----------
@@ -302,6 +455,7 @@ twilioMediaServer.on("connection", (client) => {
 server.listen(port, () => {
   console.log(`Voice sales agent listening on http://localhost:${port}  (open /voice)`);
   console.log(`Agent backend: ${wholesaleAgentUrl}`);
+  warmFillers(); // pre-synthesize fillers so they play instantly on the first turn
   if (twilioAuthToken && publicBaseUrl) {
     console.log(`Twilio media stream enabled at ${publicBaseUrl.replace(/^http/, "ws")}/twilio/media`);
   }
@@ -318,6 +472,16 @@ async function deliverTranscript(event) {
     signal: AbortSignal.timeout(5000),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
+}
+
+// A transcript counts as a real utterance only if it has 2+ words, or one word
+// of 3+ letters (e.g. "yes", "stop", "place"). Filters STT noise from keyboard
+// clicks and background sound that slip past the client voice-activity gate.
+function isMeaningful(text) {
+  const words = text.match(/[\p{L}\p{N}']+/gu) || [];
+  if (words.length >= 2) return true;
+  if (words.length === 1) return words[0].length >= 3;
+  return false;
 }
 
 function writeJson(response, status, body) {

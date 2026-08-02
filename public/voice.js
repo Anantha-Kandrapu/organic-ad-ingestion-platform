@@ -5,6 +5,39 @@ const toggle = document.getElementById("toggle");
 const statusEl = document.getElementById("status");
 const partialEl = document.getElementById("partial");
 const logEl = document.getElementById("log");
+const timerEl = document.getElementById("timer");
+const meterEl = document.getElementById("meter");
+const meterMarkEl = document.getElementById("meterMark");
+
+// Live mic meter: fill = current level; the tick = the gate threshold.
+// Bar turns green when the level clears the gate (treated as speech).
+function updateMeter(level, threshold) {
+  if (!meterEl) return;
+  meterEl.style.width = Math.min(100, (level / METER_SCALE) * 100) + "%";
+  meterEl.style.background = level > threshold ? "#5be389" : "#3f5877";
+  if (meterMarkEl) {
+    meterMarkEl.style.left = Math.min(100, (threshold / METER_SCALE) * 100) + "%";
+  }
+}
+
+let timerId = null;
+let callStart = 0;
+function startTimer() {
+  if (timerId) return;
+  callStart = Date.now();
+  timerEl.textContent = "00:00";
+  timerId = setInterval(() => {
+    const s = Math.floor((Date.now() - callStart) / 1000);
+    const mm = String(Math.floor(s / 60)).padStart(2, "0");
+    const ss = String(s % 60).padStart(2, "0");
+    timerEl.textContent = `${mm}:${ss}`;
+  }, 500);
+}
+function stopTimer() {
+  if (timerId) clearInterval(timerId);
+  timerId = null;
+  timerEl.textContent = "Ready to call";
+}
 
 let ws = null;
 let audioContext = null;
@@ -12,10 +45,24 @@ let mediaStream = null;
 let processor = null;
 let sourceNode = null;
 let running = false;
-let speaking = false; // muting mic while the agent talks (avoids echo/self-capture)
+let clientState = "listening"; // mirrors server state: listening | thinking | speaking
+let currentAudio = null; // in-flight TTS playback, so barge-in can stop it
+let currentAudioUrl = null;
+
+// --- Voice-activity gate ---
+// We only stream audio when there's real speech, so background noise and
+// keyboard clicks never reach the STT. Onset requires several sustained loud
+// frames (a click is a single transient and won't qualify); a short hangover
+// keeps streaming after speech so the STT can detect end-of-utterance.
+// Continuous listening: mic audio streams the whole time and Inworld's own
+// speech detection finds utterance boundaries. The only gate is while the agent
+// is speaking — forward audio only if it's loud enough to be a real
+// interruption (barge-in), so the agent's own voice isn't transcribed back.
+const BARGE_RMS = 0.05; // loudness needed to talk over the agent (barge-in)
+const METER_SCALE = 0.12; // full meter bar at this RMS
 
 function setStatus(state, label) {
-  statusEl.className = `status ${state}`;
+  document.body.dataset.state = state;
   statusEl.textContent = label || state;
 }
 
@@ -43,7 +90,12 @@ toggle.addEventListener("click", () => (running ? stop() : start()));
 async function start() {
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true, // suppresses keyboard/background before it hits us
+        autoGainControl: true, // normalize speech loudness; adaptive gate handles the rest
+      },
     });
   } catch (error) {
     setStatus("error", "Mic access denied");
@@ -52,6 +104,7 @@ async function start() {
 
   const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${wsProtocol}://${location.host}/voice/media`);
+  ws.addEventListener("open", startTimer);
   ws.addEventListener("message", onServerMessage);
   ws.addEventListener("close", () => running && stop());
   ws.addEventListener("error", () => setStatus("error", "Connection error"));
@@ -64,25 +117,29 @@ async function start() {
 
   const srcRate = audioContext.sampleRate;
   processor.onaudioprocess = (event) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN || speaking) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const input = event.inputBuffer.getChannelData(0);
-    const down = downsampleTo16k(input, srcRate);
-    const pcm16 = floatToInt16(down);
-    ws.send(JSON.stringify({ type: "audio", data: int16ToBase64(pcm16) }));
+    updateMeter(rms(input), BARGE_RMS);
+    // Turn-based: the mic is muted while the agent is thinking or speaking.
+    if (clientState !== "listening") return;
+    ws.send(JSON.stringify({ type: "audio", data: encodeFrame(input, srcRate) }));
   };
 
   running = true;
-  toggle.textContent = "Stop";
-  toggle.classList.add("stop");
+  toggle.classList.replace("call", "end");
+  toggle.setAttribute("aria-label", "End call");
+  timerEl.textContent = "Calling…";
   setStatus("listening", "Listening…");
 }
 
 function stop() {
   running = false;
-  speaking = false;
-  toggle.textContent = "Start talking";
-  toggle.classList.remove("stop");
+  stopPlayback();
+  stopTimer();
+  toggle.classList.replace("end", "call");
+  toggle.setAttribute("aria-label", "Call");
   setStatus("idle", "Idle");
+  if (meterEl) meterEl.style.width = "0%";
   processor?.disconnect();
   sourceNode?.disconnect();
   mediaStream?.getTracks().forEach((track) => track.stop());
@@ -100,6 +157,7 @@ function onServerMessage(event) {
   }
   switch (message.type) {
     case "status":
+      clientState = message.state;
       if (message.state === "listening") setStatus("listening", "Listening…");
       else if (message.state === "thinking") setStatus("thinking", "Thinking…");
       else if (message.state === "speaking") setStatus("speaking", "Speaking…");
@@ -120,7 +178,7 @@ function onServerMessage(event) {
       break;
     }
     case "agent_audio":
-      playAgentAudio(message.data);
+      playAgentAudio(message.data, message.filler === true);
       break;
     case "error":
       setStatus("error", message.message?.slice(0, 60) || "Error");
@@ -128,21 +186,45 @@ function onServerMessage(event) {
   }
 }
 
-function playAgentAudio(base64Wav) {
-  speaking = true;
+function playAgentAudio(base64Wav, isFiller = false) {
+  stopPlayback(); // cut any playing filler when the real reply arrives
   const bytes = base64ToBytes(base64Wav);
   const blob = new Blob([bytes], { type: "audio/wav" });
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  audio.addEventListener("ended", () => {
-    URL.revokeObjectURL(url);
-    speaking = false;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "playback_done" }));
-  });
-  audio.play().catch(() => {
-    speaking = false;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "playback_done" }));
-  });
+  currentAudioUrl = URL.createObjectURL(blob);
+  currentAudio = new Audio(currentAudioUrl);
+  const onEnd = () => {
+    // Fillers don't end the turn — only the real reply signals playback_done.
+    if (!isFiller && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "playback_done" }));
+    }
+    cleanupAudio();
+  };
+  currentAudio.addEventListener("ended", onEnd);
+  currentAudio.play().catch(onEnd);
+}
+
+// Stop playback immediately (barge-in) without signalling a natural finish.
+function stopPlayback() {
+  if (currentAudio) currentAudio.pause();
+  cleanupAudio();
+}
+
+function cleanupAudio() {
+  if (currentAudioUrl) {
+    URL.revokeObjectURL(currentAudioUrl);
+    currentAudioUrl = null;
+  }
+  currentAudio = null;
+}
+
+function rms(float32) {
+  let sum = 0;
+  for (let i = 0; i < float32.length; i += 1) sum += float32[i] * float32[i];
+  return Math.sqrt(sum / float32.length);
+}
+
+function encodeFrame(float32, srcRate) {
+  return int16ToBase64(floatToInt16(downsampleTo16k(float32, srcRate)));
 }
 
 // --- audio helpers -------------------------------------------------------------
