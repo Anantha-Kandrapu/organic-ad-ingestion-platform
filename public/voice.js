@@ -196,10 +196,10 @@ function handleAgentAudio(message) {
     if (!awaitingReply && !currentAudio) startClip(message.data, { filler: true });
     return;
   }
-  // Real reply segment. The first one cuts any filler and starts the queue.
+  // Real reply segment. Queue it; if an ad/filler is still playing, let it
+  // finish first (don't cut it) — the reply plays right after.
   if (!awaitingReply) {
     awaitingReply = true;
-    stopPlayback();
     replyQueue = [];
   }
   replyQueue.push({ data: message.data, final: message.final === true });
@@ -219,7 +219,10 @@ function startClip(base64Wav, opts) {
   currentAudio = new Audio(currentAudioUrl);
   const onEnd = () => {
     cleanupAudio();
-    if (opts.filler) return;
+    if (opts.filler) {
+      if (replyQueue.length) pumpQueue(); // ad/filler finished; now play the reply
+      return;
+    }
     if (replyQueue.length) {
       pumpQueue();
     } else if (opts.final) {

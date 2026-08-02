@@ -222,21 +222,27 @@ function randomFiller() {
   return fillerCache[Math.floor(Math.random() * fillerCache.length)];
 }
 
-// Sponsored ads that fill the processing gap (in the sponsor voice). Synthesized
-// once at startup and cached, so replaying them costs no TTS quota.
+// Sponsored ads that fill the processing gap (in the sponsor voice), tagged with
+// keywords for a similarity match. Synthesized once at startup and cached, so
+// replaying them costs no TTS quota.
 const GAP_ADS = [
-  "While I check that — today's featured deal: five percent off all dairy bulk orders over thirty units, from FreshFarm.",
-  "One moment — a quick word from AquaPure: forty-plus cases of spring water ship free today.",
-  "Just a sec — SnackCo has potato chips at the week's lowest bulk price right now.",
-  "Give me a moment — GoldenGrain basmati pallets come with a free display stand this week.",
+  { keywords: ["dairy", "milk", "cheese", "cheddar"], text: "While I check that — today's featured deal: five percent off all dairy bulk orders over thirty units, from FreshFarm." },
+  { keywords: ["water", "spring", "beverage", "drink", "aqua"], text: "One moment — a quick word from AquaPure: forty-plus cases of spring water ship free today." },
+  { keywords: ["chip", "chips", "snack", "snacks", "potato", "crisp"], text: "Just a sec — SnackCo has potato chips at the week's lowest bulk price right now." },
+  { keywords: ["rice", "grain", "grains", "basmati"], text: "Give me a moment — GoldenGrain basmati pallets come with a free display stand this week." },
+  { keywords: ["cola", "soda", "soft drink", "beverage", "drink"], text: "Quick note — Cola Classic: buy two pallets today, get the third at twenty percent off." },
+  { keywords: ["nut", "nuts", "snack", "snacks", "almond"], text: "One sec — NuttyCo: spend two hundred dollars on snacks and get eight percent back." },
 ];
-const adClipCache = [];
+const adClipCache = []; // { keywords, data }
+
+// How often a turn gets a sponsored gap ad (the rest get a short filler).
+const adProbability = Number(process.env.AD_PROBABILITY || 0.5);
 
 async function warmAds() {
-  for (const line of GAP_ADS) {
+  for (const ad of GAP_ADS) {
     try {
-      const wav = await synthesizeSponsorSpeech(line);
-      adClipCache.push(wav.toString("base64"));
+      const wav = await synthesizeSponsorSpeech(ad.text);
+      adClipCache.push({ keywords: ad.keywords, data: wav.toString("base64") });
     } catch (error) {
       console.warn("Ad clip warmup failed:", error.message);
       return;
@@ -244,12 +250,21 @@ async function warmAds() {
   }
 }
 
-// A clip to fill the gap: prefer a sponsored ad, fall back to a generic filler.
-function gapClip() {
-  if (adClipCache.length) {
-    return adClipCache[Math.floor(Math.random() * adClipCache.length)];
-  }
-  return randomFiller();
+// Pick an ad by similarity to what the customer just said, with randomization so
+// it isn't always the same one: score by keyword overlap, then choose randomly
+// among the top-scoring ads (falling back to any ad when nothing clearly matches).
+function pickAd(utterance) {
+  if (!adClipCache.length) return null;
+  const text = (utterance || "").toLowerCase();
+  const scored = adClipCache.map((ad) => ({
+    ad,
+    score: ad.keywords.reduce((n, kw) => (text.includes(kw) ? n + 1 : n), 0),
+  }));
+  const maxScore = Math.max(...scored.map((s) => s.score));
+  const pool = maxScore > 0
+    ? scored.filter((s) => s.score > 0 && s.score >= maxScore - 1).map((s) => s.ad)
+    : adClipCache;
+  return pool[Math.floor(Math.random() * pool.length)].data;
 }
 
 // Ada's own voice: Inworld (reliable, handles the conversation volume).
@@ -474,8 +489,9 @@ browserVoiceServer.on("connection", (client) => {
       busy = true;
       send({ type: "user_transcript", text: clean });
       setState("thinking");
-      // Fill the STT → agent → TTS gap with a sponsored ad (or a filler).
-      const clip = gapClip();
+      // Gap clip: a relevant sponsored ad ~30% of turns (similarity + a bit of
+      // randomness), otherwise a short generic filler.
+      const clip = Math.random() < adProbability ? pickAd(clean) : randomFiller();
       if (clip) send({ type: "agent_audio", filler: true, data: clip });
       try {
         const reply = await sendToAgent({
@@ -531,7 +547,7 @@ browserVoiceServer.on("connection", (client) => {
         conversationId,
         message:
           "The customer just connected the call. Greet them warmly in one short "
-          + "sentence and mention one of today's featured sponsored deals.",
+          + "sentence and ask how you can help.",
       });
       conversationId = reply.conversationId;
       send({ type: "agent_text", text: stripAdTags(reply.text) });
