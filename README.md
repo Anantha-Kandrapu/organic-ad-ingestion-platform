@@ -1,12 +1,13 @@
-# Phone call → Inworld STT bridge
+# Conversational ad injection service
 
 This service does one job: it receives an inbound Twilio phone-call audio stream,
 converts Twilio's 8 kHz G.711 mu-law frames to the 16 kHz LINEAR16 format required
 by Inworld streaming STT, and emits transcript events from
 `inworld/inworld-stt-1`.
 
-It does not answer questions, speak to the caller, search products, inject ads,
-or place orders.
+It also exposes an ad-selection layer backed by locally ingested Bright Data
+products, a browser voice demo, Inworld TTS, a wholesale-agent integration, and
+a Twilio speech-driven call flow. It does not place orders.
 
 ## Provider flow
 
@@ -78,6 +79,77 @@ GET /health
 ```
 
 Returns the selected Inworld model without exposing credentials.
+
+## Sponsored product selection
+
+`POST /ads/select` matches shopping intent against the local product catalog,
+applies budget, rejection, availability, and per-call frequency controls, and
+returns fixed-template spoken copy with an explicit sponsored disclosure.
+
+```json
+{
+  "callSid": "CA123",
+  "intent": "I need dishwasher-safe kitchen scissors under ten dollars",
+  "maxPrice": 10,
+  "rejectedAsins": []
+}
+```
+
+A successful response includes `eligible: true`, the selected product, match
+terms, and `spokenCopy`. When no product is suitable or the call reaches its
+frequency cap, it returns `eligible: false` with a machine-readable reason.
+Set `AD_API_BEARER` in production and send it as an `Authorization: Bearer ...`
+header to protect this endpoint.
+
+Only catalog records explicitly marked `sponsored: true` are eligible. The
+selector treats catalog text only as matching data, and spoken copy is generated
+from a fixed template using the product brand, title, and price. A selection is
+logged as a decision, not an impression; durable campaign and playback-event
+storage remain future work.
+
+## Injection demo
+
+Open `/demo` for the one-button browser voice flow. The product-agent request
+starts in parallel with a random sponsor break. Inworld TTS speaks the disclosed
+sponsor while results are being fetched, then a second Inworld TTS call speaks
+the agent response. The UI and debug JSON preserve separate `injected_ad` and
+`llm_response` records.
+
+```json
+{
+  "llmResponse": { "type": "llm_response", "text": "..." },
+  "injectedAd": { "type": "injected_ad", "decisionId": "addec_..." },
+  "segments": [
+    { "type": "llm_response", "source": "demo_llm", "text": "..." },
+    { "type": "injected_ad", "source": "ad_engine", "text": "..." },
+    { "type": "llm_response", "source": "demo_llm", "text": "..." }
+  ],
+  "injection": { "happened": true, "segmentIndex": 1 }
+}
+```
+
+`composedResponse.text` is derived from these segments, so the demo can show the
+exact insertion boundary while still producing one string suitable for speech.
+
+When `WHOLESALE_AGENT_URL` is configured, the `llmResponse` comes from the
+FastAPI wholesale sales agent. The ad engine still selects and inserts
+`injectedAd` independently. If the wholesale service is unavailable or exceeds
+the phone-safe timeout, the deterministic demo response is used instead.
+
+## Callable demo
+
+With `VOICE_MODE=demo`, an inbound Twilio call uses speech capture to ask what
+the caller wants. `POST /twilio/respond` selects an ad, preserves the typed
+`llm_response` and `injected_ad` segments internally, and returns TwiML that
+speaks those segments in order with a pause around the sponsored insertion.
+
+Set the Twilio number's incoming voice webhook to:
+
+```text
+POST $PUBLIC_BASE_URL/twilio/voice
+```
+
+Set `VOICE_MODE=stream` to restore the direct Twilio Media Stream to Inworld STT.
 
 ## Important format detail
 

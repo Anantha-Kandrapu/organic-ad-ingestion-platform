@@ -3,3 +3,9 @@ node_modules/
 CREDENTIALS.md
 npm-debug.log*
 .DS_Store
+data/products/*.raw.ndjson
+data/products/*.error.txt
+.tools/
+app/combined_cacerts.pem
+__pycache__/
+*.py[cod]

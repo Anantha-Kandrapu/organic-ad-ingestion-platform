@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Streams inbound Twilio call audio to Inworld STT and emits transcripts.",
+  "description": "Transcribes Twilio calls and selects contextual sponsored products.",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/audio.js"
+    "check": "node --check src/server.js && node --check src/audio.js && node --check src/ads.js && node --check src/composer.js && node --check src/voice-demo.js && node --check src/wholesale-client.js && node --check public/demo.js"
   },
   "engines": {
     "node": ">=20"

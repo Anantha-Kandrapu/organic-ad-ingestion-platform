@@ -1,7 +1,21 @@
 import crypto from "node:crypto";
 import http from "node:http";
+import { readFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
 import { twilioMulaw8kToLinear16k } from "./audio.js";
+import {
+  loadProductCatalog,
+  selectRandomSponsoredProduct,
+  selectSponsoredProduct,
+} from "./ads.js";
+import { composeDemoTurn } from "./composer.js";
+import {
+  buildGatherTwiML,
+  buildRetryTwiML,
+  buildSpokenTurnTwiML,
+  parseSpokenBudget,
+} from "./voice-demo.js";
+import { getWholesaleResponse } from "./wholesale-client.js";
 
 const requiredEnvironment = ["INWORLD_API_KEY", "TWILIO_AUTH_TOKEN", "PUBLIC_BASE_URL"];
 const missingEnvironment = requiredEnvironment.filter((name) => !process.env[name]?.trim());
@@ -16,14 +30,181 @@ const publicBaseUrl = process.env.PUBLIC_BASE_URL.replace(/\/$/, "");
 const publicWebSocketBaseUrl = publicBaseUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const inworldApiKey = process.env.INWORLD_API_KEY;
+const inworldTtsModel = process.env.INWORLD_TTS_MODEL?.trim() || "inworld-tts-2";
+const inworldTtsSponsorVoice = process.env.INWORLD_TTS_SPONSOR_VOICE?.trim() || "Dennis";
+const inworldTtsAgentVoice = process.env.INWORLD_TTS_AGENT_VOICE?.trim() || "Ashley";
 const sttLanguage = process.env.STT_LANGUAGE || "en-US";
 const transcriptWebhookUrl = process.env.TRANSCRIPT_WEBHOOK_URL?.trim();
 const transcriptWebhookBearer = process.env.TRANSCRIPT_WEBHOOK_BEARER?.trim();
+const adApiBearer = process.env.AD_API_BEARER?.trim();
+const voiceMode = process.env.VOICE_MODE?.trim() || "demo";
+const wholesaleAgentUrl = process.env.WHOLESALE_AGENT_URL?.trim();
+const productCatalogPath = process.env.PRODUCT_CATALOG_PATH
+  || new URL("../data/products/brightdata-amazon-2026-08-01.products.json", import.meta.url);
+const adFrequencyCap = Number(process.env.AD_FREQUENCY_CAP || 2);
+if (!Number.isInteger(adFrequencyCap) || adFrequencyCap < 1) {
+  throw new Error("AD_FREQUENCY_CAP must be a positive integer");
+}
+const products = await loadProductCatalog(productCatalogPath);
+const adSessions = new Map();
+let lastDemoSponsoredAsin;
+const demoAssets = {
+  "/": ["demo.html", "text/html; charset=utf-8"],
+  "/demo": ["demo.html", "text/html; charset=utf-8"],
+  "/demo.css": ["demo.css", "text/css; charset=utf-8"],
+  "/demo.js": ["demo.js", "text/javascript; charset=utf-8"],
+};
 
 const server = http.createServer(async (request, response) => {
   try {
+    if (request.method === "GET" && demoAssets[request.url]) {
+      const [fileName, contentType] = demoAssets[request.url];
+      const contents = await readFile(new URL(`../public/${fileName}`, import.meta.url));
+      response.writeHead(200, { "Content-Type": contentType });
+      response.end(contents);
+      return;
+    }
+
     if (request.method === "GET" && request.url === "/health") {
-      return writeJson(response, 200, { status: "ok", model: "inworld/inworld-stt-1" });
+      return writeJson(response, 200, {
+        status: "ok",
+        model: "inworld/inworld-stt-1",
+        products: products.length,
+      });
+    }
+
+    if (request.method === "POST" && request.url === "/ads/select") {
+      if (adApiBearer && request.headers.authorization !== `Bearer ${adApiBearer}`) {
+        return writeJson(response, 401, { error: "Invalid ad API credential" });
+      }
+      const input = await readJsonBody(request);
+      const callSid = input.callSid?.trim();
+      if (!callSid) return writeJson(response, 400, { error: "callSid is required" });
+      if (input.rejectedAsins != null && !Array.isArray(input.rejectedAsins)) {
+        return writeJson(response, 400, { error: "rejectedAsins must be an array" });
+      }
+
+      const session = getAdSession(callSid);
+      for (const asin of input.rejectedAsins || []) session.rejectedAsins.add(asin);
+      if (session.decisions >= adFrequencyCap) {
+        return writeJson(response, 200, {
+          type: "ad.selection",
+          eligible: false,
+          reason: "frequency_cap",
+        });
+      }
+
+      const selection = selectSponsoredProduct(products, {
+        ...input,
+        rejectedAsins: [...session.rejectedAsins],
+        shownAsins: [...session.shownAsins],
+      });
+      if (!selection) {
+        return writeJson(response, 200, {
+          type: "ad.selection",
+          eligible: false,
+          reason: "no_match",
+        });
+      }
+
+      session.shownAsins.add(selection.product.asin);
+      session.decisions += 1;
+      session.updatedAt = Date.now();
+      console.log(JSON.stringify({
+        type: "ad.decision",
+        callSid,
+        asin: selection.product.asin,
+        disclosure: selection.disclosure,
+        occurredAt: new Date().toISOString(),
+      }));
+      return writeJson(response, 200, { callSid, ...selection });
+    }
+
+    if (request.method === "POST" && request.url === "/api/demo/sponsor") {
+      const input = await readJsonBody(request);
+      const callSid = input.callSid?.trim();
+      if (!callSid) return writeJson(response, 400, { error: "callSid is required" });
+
+      const selection = selectRandomSponsoredProduct(
+        products,
+        lastDemoSponsoredAsin ? [lastDemoSponsoredAsin] : [],
+      );
+      if (!selection) return writeJson(response, 404, { error: "No sponsored inventory available" });
+      lastDemoSponsoredAsin = selection.product.asin;
+
+      const injectedAd = {
+        id: `ad_${crypto.randomUUID()}`,
+        type: "injected_ad",
+        source: "ad_engine",
+        disclosure: selection.disclosure,
+        text: selection.breakCopy,
+        product: selection.product,
+        match: selection.match,
+      };
+      return writeJson(response, 200, {
+        type: "sponsor_break",
+        callSid,
+        phase: "fetching_web_results",
+        injectedAd,
+        segments: [injectedAd],
+      });
+    }
+
+    if (request.method === "POST" && request.url === "/api/tts") {
+      const input = await readJsonBody(request);
+      const text = input.text?.trim();
+      if (!text) return writeJson(response, 400, { error: "text is required" });
+      if (text.length > 2000) return writeJson(response, 400, { error: "text exceeds 2,000 characters" });
+      if (input.role !== "sponsor" && input.role !== "agent") {
+        return writeJson(response, 400, { error: "role must be sponsor or agent" });
+      }
+
+      const voiceId = input.role === "sponsor"
+        ? inworldTtsSponsorVoice
+        : inworldTtsAgentVoice;
+      const audio = await synthesizeInworldSpeech(text, voiceId);
+      response.writeHead(200, {
+        "Content-Type": "audio/wav",
+        "Content-Length": audio.byteLength,
+        "Cache-Control": "no-store",
+        "X-TTS-Provider": "inworld",
+        "X-TTS-Model": inworldTtsModel,
+        "X-TTS-Voice": voiceId,
+      });
+      response.end(audio);
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/api/demo/turn") {
+      const input = await readJsonBody(request);
+      const callSid = input.callSid?.trim();
+      const transcript = input.transcript?.trim();
+      if (!callSid) return writeJson(response, 400, { error: "callSid is required" });
+      if (!transcript) return writeJson(response, 400, { error: "transcript is required" });
+
+      const selection = input.suppressAd
+        ? { eligible: false, reason: "sponsor_break_already_served" }
+        : selectSponsoredProduct(products, {
+          intent: transcript,
+          maxPrice: input.maxPrice,
+        });
+      const turnId = `turn_${crypto.randomUUID()}`;
+      const wholesale = await tryWholesaleResponse(transcript);
+      const turn = composeDemoTurn({
+        callSid,
+        transcript,
+        turnId,
+        llmText: wholesale?.text,
+        selection: selection || { eligible: false, reason: "no_match" },
+      });
+      console.log(JSON.stringify({
+        type: "demo.turn",
+        turnId,
+        callSid,
+        injectionHappened: turn.injection.happened,
+        segmentTypes: turn.segments.map((segment) => segment.type),
+      }));
+      return writeJson(response, 200, turn);
     }
 
     if (request.method === "POST" && request.url === "/twilio/voice") {
@@ -35,6 +216,12 @@ const server = http.createServer(async (request, response) => {
         return writeJson(response, 403, { error: "Invalid Twilio signature" });
       }
 
+      if (voiceMode === "demo") {
+        return writeXml(response, 200, buildGatherTwiML({
+          actionUrl: `${publicBaseUrl}/twilio/respond`,
+        }));
+      }
+
       const streamUrl = `${publicWebSocketBaseUrl}/twilio/media`;
       response.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
       response.end(
@@ -44,12 +231,81 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && request.url === "/twilio/respond") {
+      const body = await readRequestBody(request);
+      const params = Object.fromEntries(new URLSearchParams(body));
+      const exactUrl = `${publicBaseUrl}/twilio/respond`;
+      if (!isValidTwilioSignature(request.headers["x-twilio-signature"], exactUrl, params)) {
+        return writeJson(response, 403, { error: "Invalid Twilio signature" });
+      }
+
+      const transcript = params.SpeechResult?.trim();
+      if (!transcript) {
+        return writeXml(response, 200, buildRetryTwiML({
+          voiceUrl: `${publicBaseUrl}/twilio/voice`,
+        }));
+      }
+
+      const callSid = params.CallSid || `call_${crypto.randomUUID()}`;
+      const selection = selectSponsoredProduct(products, {
+        intent: transcript,
+        maxPrice: parseSpokenBudget(transcript),
+      });
+      const wholesale = await tryWholesaleResponse(transcript);
+      const turn = composeDemoTurn({
+        callSid,
+        transcript,
+        turnId: `turn_${crypto.randomUUID()}`,
+        selection: selection || { eligible: false, reason: "no_match" },
+        llmText: wholesale?.text,
+      });
+      console.log(JSON.stringify({
+        type: "voice.demo.turn",
+        callSid,
+        transcript,
+        injectionHappened: turn.injection.happened,
+        segmentTypes: turn.segments.map((segment) => segment.type),
+      }));
+      return writeXml(response, 200, buildSpokenTurnTwiML(turn));
+    }
+
     writeJson(response, 404, { error: "Not found" });
   } catch (error) {
+    if (error instanceof TypeError) {
+      return writeJson(response, 400, { error: error.message });
+    }
     console.error("HTTP error", error);
     writeJson(response, 500, { error: "Internal server error" });
   }
 });
+
+async function synthesizeInworldSpeech(text, voiceId) {
+  const ttsResponse = await fetch("https://api.inworld.ai/tts/v1/voice", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${inworldApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text,
+      voiceId,
+      modelId: inworldTtsModel,
+      audioConfig: {
+        audioEncoding: "LINEAR16",
+        sampleRateHertz: 22050,
+      },
+      deliveryMode: "BALANCED",
+      applyTextNormalization: "ON",
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const payload = await ttsResponse.json();
+  if (!ttsResponse.ok || !payload.audioContent) {
+    const detail = payload.message || payload.error?.message || `HTTP ${ttsResponse.status}`;
+    throw new Error(`Inworld TTS failed: ${detail}`);
+  }
+  return Buffer.from(payload.audioContent, "base64");
+}
 
 const twilioWebSocketServer = new WebSocketServer({ noServer: true });
 
@@ -206,6 +462,16 @@ async function deliverTranscript(event) {
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
 }
 
+async function tryWholesaleResponse(message) {
+  if (!wholesaleAgentUrl) return null;
+  try {
+    return await getWholesaleResponse({ baseUrl: wholesaleAgentUrl, message });
+  } catch (error) {
+    console.warn("Wholesale agent unavailable; using demo response", { message: error.message });
+    return null;
+  }
+}
+
 function isValidTwilioSignature(providedSignature, exactUrl, params) {
   if (!providedSignature) return false;
   const sortedKeys = Object.keys(params).sort();
@@ -234,10 +500,43 @@ function readRequestBody(request) {
   });
 }
 
+async function readJsonBody(request) {
+  const body = await readRequestBody(request);
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new TypeError("Invalid JSON body");
+  }
+}
+
+function getAdSession(callSid) {
+  const now = Date.now();
+  for (const [sessionCallSid, session] of adSessions) {
+    if (now - session.updatedAt > 4 * 60 * 60 * 1000) adSessions.delete(sessionCallSid);
+  }
+  const existing = adSessions.get(callSid);
+  if (existing) return existing;
+
+  const session = {
+    decisions: 0,
+    shownAsins: new Set(),
+    rejectedAsins: new Set(),
+    updatedAt: now,
+  };
+  adSessions.set(callSid, session);
+  return session;
+}
+
 function writeJson(response, status, body) {
   if (response.headersSent) return;
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
+}
+
+function writeXml(response, status, body) {
+  if (response.headersSent) return;
+  response.writeHead(status, { "Content-Type": "text/xml; charset=utf-8" });
+  response.end(body);
 }
 
 function escapeXml(value) {

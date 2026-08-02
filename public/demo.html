@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>The Break — Voice Shopping</title>
+    <link rel="stylesheet" href="/demo.css">
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+
+    <header class="masthead">
+      <div class="wordmark">THE BREAK<span>/VOICE</span></div>
+      <div class="live-pill"><i></i> Live</div>
+    </header>
+
+    <main>
+      <section class="voice-console">
+        <p class="kicker">Voice shopping assistant</p>
+        <h1>Ask.<br><em>Then listen.</em></h1>
+        <p class="instruction">Tap once and say what you are shopping for. The assistant answers out loud automatically.</p>
+
+        <button id="mic" class="mic-button" type="button" aria-label="Start voice request">
+          <span class="rings" aria-hidden="true"><i></i></span>
+          <strong>Start talking</strong>
+          <small>Tap to use microphone</small>
+        </button>
+
+        <div id="status" class="status" aria-live="polite">Ready when you are</div>
+        <p id="heard" class="heard" aria-live="polite"></p>
+      </section>
+
+      <section id="response" class="response" aria-live="polite" hidden>
+        <div class="response-heading">
+          <span>Spoken response</span>
+          <div class="legend">
+            <span><i class="organic-dot"></i> Assistant</span>
+            <span><i class="ad-dot"></i> Sponsored ad</span>
+          </div>
+        </div>
+        <div id="segments" class="segments"></div>
+      </section>
+
+      <section id="debug" class="debug" hidden>
+        <div class="debug-heading">
+          <span>Debug</span>
+          <small>Raw API response</small>
+        </div>
+        <pre id="json"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="/demo.js"></script>
+  </body>
+</html>
