@@ -1,8 +1,6 @@
-import crypto from "node:crypto";
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
-import { twilioMulaw8kToLinear16k } from "./audio.js";
 import { sendToAgent } from "./agent-client.js";
 
 const requiredEnvironment = ["INWORLD_API_KEY"];
@@ -26,11 +24,6 @@ const tenstorrentBaseUrl = (process.env.TENSTORRENT_BASE_URL?.trim()
 const tenstorrentTtsModel = process.env.TENSTORRENT_TTS_MODEL?.trim() || "inworld-tts-2";
 const sttLanguage = process.env.STT_LANGUAGE || "en-US";
 const wholesaleAgentUrl = (process.env.WHOLESALE_AGENT_URL?.trim() || "http://127.0.0.1:8000");
-const transcriptWebhookUrl = process.env.TRANSCRIPT_WEBHOOK_URL?.trim();
-const transcriptWebhookBearer = process.env.TRANSCRIPT_WEBHOOK_BEARER?.trim();
-// Twilio phone STT is optional; enabled only when an auth token is present.
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN?.trim();
-const publicBaseUrl = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, "");
 
 const staticAssets = {
   "/": ["voice.html", "text/html; charset=utf-8"],
@@ -82,7 +75,7 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-// --- Inworld streaming STT session (shared by browser + Twilio) ----------------
+// --- Inworld streaming STT session ---------------------------------------------
 
 const SILENCE_FRAME = Buffer.alloc(640).toString("base64"); // 320 samples of 16-bit silence
 
@@ -236,13 +229,13 @@ const GAP_ADS = [
 const adClipCache = []; // { keywords, data }
 
 // How often a turn gets a sponsored gap ad (the rest get a short filler).
-const adProbability = Number(process.env.AD_PROBABILITY || 0.5);
+const adProbability = Number(process.env.AD_PROBABILITY || 0.4);
 
 async function warmAds() {
   for (const ad of GAP_ADS) {
     try {
       const wav = await synthesizeSponsorSpeech(ad.text);
-      adClipCache.push({ keywords: ad.keywords, data: wav.toString("base64") });
+      adClipCache.push({ keywords: ad.keywords, text: ad.text, data: wav.toString("base64") });
     } catch (error) {
       console.warn("Ad clip warmup failed:", error.message);
       return;
@@ -264,8 +257,18 @@ function pickAd(utterance) {
   const pool = maxScore > 0
     ? scored.filter((s) => s.score > 0 && s.score >= maxScore - 1).map((s) => s.ad)
     : adClipCache;
-  return pool[Math.floor(Math.random() * pool.length)].data;
+  // Avoid repeating a recently-played ad: prefer relevant-and-fresh, then any
+  // fresh ad, and only repeat as a last resort.
+  const fresh = (arr) => arr.filter((a) => !recentAdTexts.includes(a.text));
+  const choices = fresh(pool).length ? fresh(pool)
+    : fresh(adClipCache).length ? fresh(adClipCache)
+    : pool;
+  const chosen = choices[Math.floor(Math.random() * choices.length)];
+  recentAdTexts.push(chosen.text);
+  if (recentAdTexts.length > 3) recentAdTexts.shift();
+  return { data: chosen.data, text: chosen.text };
 }
+let recentAdTexts = [];
 
 // Ada's own voice: Inworld (reliable, handles the conversation volume).
 async function synthesizeAgentSpeech(text) {
@@ -282,7 +285,14 @@ async function synthesizeSponsorSpeech(text) {
       console.warn("Tenstorrent sponsor TTS failed, using Inworld:", error.message);
     }
   }
-  return synthesizeInworldSpeech(text, inworldSponsorVoice);
+  // Try the distinct Inworld sponsor voice; if that voice is invalid on this
+  // account, fall back to the agent voice so the ad still plays.
+  try {
+    return await synthesizeInworldSpeech(text, inworldSponsorVoice);
+  } catch (error) {
+    console.warn("Inworld sponsor voice failed, using agent voice:", error.message);
+    return synthesizeInworldSpeech(text, inworldTtsAgentVoice);
+  }
 }
 
 // Tenstorrent OpenAI-compatible TTS. Input is capped (~150–180 words), so long
@@ -447,17 +457,12 @@ async function speakReply(send, text) {
 // --- WebSocket routing ---------------------------------------------------------
 
 const browserVoiceServer = new WebSocketServer({ noServer: true });
-const twilioMediaServer = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
   const path = new URL(request.url, "http://localhost").pathname;
   if (path === "/voice/media") {
     browserVoiceServer.handleUpgrade(request, socket, head, (client) => {
       browserVoiceServer.emit("connection", client, request);
-    });
-  } else if (path === "/twilio/media" && twilioAuthToken) {
-    twilioMediaServer.handleUpgrade(request, socket, head, (client) => {
-      twilioMediaServer.emit("connection", client, request);
     });
   } else {
     socket.destroy();
@@ -469,6 +474,8 @@ server.on("upgrade", (request, socket, head) => {
 browserVoiceServer.on("connection", (client) => {
   let conversationId = null;
   let busy = false; // agent is thinking/speaking; input is ignored until it finishes
+  let turnCount = 0; // user turns so far this call
+  let adsShown = 0; // sponsored ads played so far this call
 
   const send = (message) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(message));
@@ -487,12 +494,27 @@ browserVoiceServer.on("connection", (client) => {
       }
       if (busy || !isMeaningful(clean)) return; // one turn at a time; ignore noise
       busy = true;
+      turnCount += 1;
       send({ type: "user_transcript", text: clean });
       setState("thinking");
-      // Gap clip: a relevant sponsored ad ~30% of turns (similarity + a bit of
-      // randomness), otherwise a short generic filler.
-      const clip = Math.random() < adProbability ? pickAd(clean) : randomFiller();
-      if (clip) send({ type: "agent_audio", filler: true, data: clip });
+      // Gap clip while thinking. Sponsored ads run only in the first two turns —
+      // with at least one guaranteed by the 2nd message — and none after that,
+      // where it's just a short generic filler.
+      let showAd = false;
+      if (turnCount <= 2) {
+        showAd = Math.random() < adProbability;
+        if (turnCount === 2 && adsShown === 0) showAd = true; // guarantee one by turn 2
+      }
+      if (showAd) {
+        const ad = pickAd(clean);
+        if (ad) {
+          adsShown += 1;
+          send({ type: "agent_audio", filler: true, ad: true, text: ad.text, data: ad.data });
+        }
+      } else {
+        const f = randomFiller();
+        if (f) send({ type: "agent_audio", filler: true, data: f });
+      }
       try {
         const reply = await sendToAgent({
           baseUrl: wholesaleAgentUrl,
@@ -510,10 +532,16 @@ browserVoiceServer.on("connection", (client) => {
         setState("speaking");
         await speakReply(send, reply.text);
       } catch (error) {
+        // Slow/failed turn: recover gracefully with a spoken prompt, not dead air.
         console.error("Voice turn failed", error.message);
-        send({ type: "error", message: error.message });
-        setState("listening");
-        busy = false;
+        try {
+          setState("speaking");
+          await speakReply(send, "Sorry, I didn't catch that — could you say it again?");
+        } catch {
+          send({ type: "error", message: error.message });
+          setState("listening");
+          busy = false;
+        }
       }
     },
     onError: (error) => send({ type: "error", message: `STT: ${error.message}` }),
@@ -562,41 +590,6 @@ browserVoiceServer.on("connection", (client) => {
   greet();
 });
 
-// --- Twilio phone STT (optional, no ads): media stream -> Inworld STT ----------
-
-twilioMediaServer.on("connection", (client) => {
-  let streamSid;
-  let callSid;
-  const stt = createInworldSttSession({
-    onTranscript: ({ text, isFinal }) => {
-      if (!text.trim()) return;
-      const event = { callSid, streamSid, text, isFinal, receivedAt: new Date().toISOString() };
-      console.log(JSON.stringify({ type: "transcription", ...event }));
-      if (isFinal) deliverTranscript(event).catch((e) => console.error("webhook failed", e.message));
-    },
-    onError: () => client.close(1011, "STT error"),
-  });
-
-  client.on("message", (raw) => {
-    let event;
-    try {
-      event = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-    if (event.event === "start") {
-      streamSid = event.start?.streamSid;
-      callSid = event.start?.callSid;
-    } else if (event.event === "media" && event.media?.payload) {
-      stt.sendPcmBase64(twilioMulaw8kToLinear16k(event.media.payload));
-    } else if (event.event === "stop") {
-      stt.close();
-    }
-  });
-  client.on("close", () => stt.close());
-  client.on("error", () => stt.close());
-});
-
 server.listen(port, () => {
   console.log(`Voice sales agent listening on http://localhost:${port}  (open /voice)`);
   console.log(`Agent backend: ${wholesaleAgentUrl}`);
@@ -604,23 +597,7 @@ server.listen(port, () => {
     warmFillers(); // generic fillers (Inworld)
     warmAds(); // sponsored gap ads (sponsor voice), cached once
   });
-  if (twilioAuthToken && publicBaseUrl) {
-    console.log(`Twilio media stream enabled at ${publicBaseUrl.replace(/^http/, "ws")}/twilio/media`);
-  }
 });
-
-async function deliverTranscript(event) {
-  if (!transcriptWebhookUrl) return;
-  const headers = { "Content-Type": "application/json" };
-  if (transcriptWebhookBearer) headers.Authorization = `Bearer ${transcriptWebhookBearer}`;
-  const response = await fetch(transcriptWebhookUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(event),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-}
 
 // A transcript counts as a real utterance only if it has 2+ words, or one word
 // of 3+ letters (e.g. "yes", "stop", "place"). Filters STT noise from keyboard
@@ -653,5 +630,3 @@ async function readJsonBody(request) {
   }
 }
 
-// Silence unused-crypto lint if Twilio validation is later re-added.
-void crypto;

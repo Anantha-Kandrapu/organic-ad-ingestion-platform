@@ -186,13 +186,19 @@ function onServerMessage(event) {
       break;
     case "error":
       setStatus("error", message.message?.slice(0, 60) || "Error");
+      // Recover so the mic re-opens and the user can try again.
+      clientState = "listening";
+      awaitingReply = false;
+      replyQueue = [];
       break;
   }
 }
 
 function handleAgentAudio(message) {
   if (message.filler) {
-    // Play a filler only if no real reply is already playing/queued.
+    // Sponsored gap ad: show it as a sponsor bubble while it's spoken.
+    if (message.ad && message.text) addTurn("sponsor", `📣 ${message.text}`);
+    // Play the gap clip only if no real reply is already playing/queued.
     if (!awaitingReply && !currentAudio) startClip(message.data, { filler: true });
     return;
   }

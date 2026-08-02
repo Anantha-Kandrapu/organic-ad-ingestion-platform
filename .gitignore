@@ -9,3 +9,6 @@ data/products/*.error.txt
 app/combined_cacerts.pem
 __pycache__/
 *.py[cod]
+
+combined_cacerts.pem
+*.mov
